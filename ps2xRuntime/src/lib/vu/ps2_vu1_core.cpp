@@ -1,3 +1,5 @@
+#include <chrono>
+#include <atomic>
 #include "runtime/ps2_vu1.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "runtime/gs/gs_frontend.h"
@@ -1620,10 +1622,29 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
 }
 
+namespace s3perf
+{
+    extern std::atomic<uint64_t> vu1Ns;
+    extern thread_local bool inVu1;
+}
+
 void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                          uint8_t *vuData, uint32_t dataSize,
                          GS &gs, PS2Memory *memory, uint32_t maxCycles)
 {
+    // s3recomp: time spent here feeds the [perf] log line and the FPS overlay.
+    struct PerfScope
+    {
+        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        PerfScope() { s3perf::inVu1 = true; }
+        ~PerfScope()
+        {
+            s3perf::inVu1 = false;
+            s3perf::vu1Ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now() - t0).count()),
+                                    std::memory_order_relaxed);
+        }
+    } perfScope;
     m_activeVuData = vuData;
     m_activeVuDataSize = dataSize;
     m_activeGs = &gs;

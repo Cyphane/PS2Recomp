@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include "iop_cdvd.h"
 
 #include "../core/iop_cpu.h"
@@ -228,6 +230,8 @@ namespace ps2x::iop::detail
                 return true;
 
             case 6: // sceCdRead
+                if (std::getenv("PS2X_TRACE_STUBS"))
+                    std::fprintf(stderr, "[iop-cdread] lsn=0x%x sectors=%u buf=0x%x pc=0x%x\n", a0, a1, a2, cpu.gpr[31]);
                 if (readSectors(a0, a1, a2))
                 {
                     signalCommandComplete();

@@ -1,3 +1,7 @@
+#include <cstdio>
+#include <cstdlib>
+#include <map>
+#include <string>
 #include "ps2_runtime.h"
 #include "ps2_log.h"
 #include "ps2_stubs.h"
@@ -5,6 +9,8 @@
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
+#include "gs/gs_vulkan_backend.h"
+#include "vu/ps2_vu1_fast.h"
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
@@ -25,6 +31,11 @@
 #include <atomic>
 #include <thread>
 #include <unordered_map>
+#include <vector>
+#include <functional>
+#include <condition_variable>
+#include <mutex>
+#include <deque>
 #include <sstream>
 
 namespace ps2_stubs
@@ -373,6 +384,306 @@ namespace
     }
 }
 
+// s3recomp debug: PS2X_VU1_CAPTURE=<file>. Creating <file>.go appends the next 400 VU1 calls (MSCAL and
+// MSCNT) to <file>: {kind, startPC, top, itop}, VU1State, 16 KiB code, 16 KiB data. Used to replay VU1
+// programs outside the game when testing VU1 changes.
+namespace s3vucap
+{
+    inline void maybeCapture(uint32_t kind, uint32_t startPC, uint32_t top, uint32_t itop, const VU1State &state,
+                             const uint8_t *code, const uint8_t *data)
+    {
+        static const char *path = std::getenv("PS2X_VU1_CAPTURE");
+        static int left = 0;
+        static uint64_t calls = 0;
+        if (!path)
+            return;
+        if (left == 0 && (++calls % 256u) == 0u)
+        {
+            const std::string go = std::string(path) + ".go";
+            if (FILE *t = std::fopen(go.c_str(), "rb"))
+            {
+                std::fclose(t);
+                std::remove(go.c_str());
+                left = 400;
+            }
+        }
+        if (left <= 0)
+            return;
+        --left;
+        if (FILE *f = std::fopen(path, "ab"))
+        {
+            const uint32_t hdr[4] = {kind, startPC, top, itop};
+            std::fwrite(hdr, 4, 4, f);
+            std::fwrite(&state, sizeof(VU1State), 1, f);
+            std::fwrite(code, 1, PS2_VU1_CODE_SIZE, f);
+            std::fwrite(data, 1, PS2_VU1_DATA_SIZE, f);
+            std::fclose(f);
+        }
+    }
+}
+
+// s3recomp: VU1 calls run on VU1Fast (same results, without the cycle-by-cycle pipeline model) unless
+// PS2X_VU1_REF=1 selects the reference interpreter. Both share the interpreter's VU1State.
+namespace s3vu1
+{
+    // Generated (native) VU1 programs are used when the game build includes them, unless
+    // PS2X_VU1_COMPILED=0.
+    inline VU1Fast &fast(VU1Interpreter &vu)
+    {
+        static VU1Fast core(vu.state(), VU1Fast::Unit::VU1);
+        static const bool configured = [] {
+            const char *v = std::getenv("PS2X_VU1_COMPILED");
+            core.m_compiledEnabled = !(v && v[0] == '0');
+            const size_t n = vu1CompiledRegionCount();
+            std::fprintf(stderr, "[vu1] %zu native VU1 programs in this build%s\n", n,
+                         n && !core.m_compiledEnabled ? " (disabled by PS2X_VU1_COMPILED=0)" : "");
+            return true;
+        }();
+        (void)configured;
+        return core;
+    }
+    inline bool useReference()
+    {
+        static const bool ref = [] {
+            const char *v = std::getenv("PS2X_VU1_REF");
+            return v && v[0] == '1';
+        }();
+        return ref;
+    }
+}
+
+namespace s3gfx
+{
+    extern std::atomic<uint64_t> kickNs, overlapNs, syncs, syncReason[6], workerBusyNs, syncWaitNs, gsRegWaits[0x110], stat[16], stubCalls[8];
+    extern void (*g_wakeEe)();
+    extern uint32_t (*g_captureFbrst)();
+    extern void (*g_applyVpuStat)(uint32_t);
+    bool enabled();
+    bool jobFbrst(uint32_t &fbrst);
+    bool jobSetVpuStat(uint32_t bits);
+}
+
+namespace s3prof
+{
+    void registerThread(const char *name); // s3_profiler.cpp (PS2X_PROFILE=1)
+}
+
+// s3recomp: GS on its own thread. GIF packets (from VU1 XGKICKs, VIF1 DIRECT and GIF DMA) are copied
+// into a queue and processed in order by a GS thread, so the GS front end and the renderer run
+// alongside the game thread instead of inside it. Nothing the game waits on depends on that work:
+// DMA completion does not, and whatever does read GS results - privileged GS registers, CSR flags
+// (FINISH/SIGNAL), image downloads, the libgraph stubs, buffer flips - first waits for the queue to
+// empty (drain). PS2X_GS_THREAD=0 turns it off; it is also off with the experimental graphics worker.
+namespace s3gsq
+{
+    namespace
+    {
+        std::mutex g_mutex;
+        std::condition_variable g_workCv, g_idleCv;
+        std::deque<std::vector<uint8_t>> g_queue;
+        std::vector<std::vector<uint8_t>> g_pool;
+        std::atomic<uint64_t> g_submitted{0}, g_completed{0};
+        std::atomic<bool> g_workerSleeping{false};
+        std::atomic<bool> g_started{false};
+        std::thread::id g_workerId;
+        std::function<void(const uint8_t *, uint32_t)> g_process;
+
+        void workerMain()
+        {
+            ThreadNaming::SetCurrentThreadName("GSThread");
+            s3prof::registerThread("gs");
+            g_workerId = std::this_thread::get_id();
+            for (;;)
+            {
+                // Spin briefly before sleeping: packets arrive in quick bursts during a frame.
+                for (uint32_t n = 0; n < 20000u && g_completed.load(std::memory_order_acquire) == g_submitted.load(std::memory_order_acquire); ++n)
+                    if ((n & 255u) == 255u)
+                        std::this_thread::yield();
+                std::vector<uint8_t> packet;
+                {
+                    std::unique_lock<std::mutex> lock(g_mutex);
+                    if (g_queue.empty())
+                    {
+                        g_workerSleeping.store(true, std::memory_order_release);
+                        g_workCv.wait(lock, [] { return !g_queue.empty(); });
+                        g_workerSleeping.store(false, std::memory_order_release);
+                    }
+                    packet = std::move(g_queue.front());
+                    g_queue.pop_front();
+                }
+                g_process(packet.data(), static_cast<uint32_t>(packet.size()));
+                {
+                    std::lock_guard<std::mutex> lock(g_mutex);
+                    if (g_pool.size() < 256u)
+                        g_pool.push_back(std::move(packet));
+                    g_completed.fetch_add(1, std::memory_order_acq_rel);
+                }
+                g_idleCv.notify_all();
+            }
+        }
+    }
+
+    bool enabledSetting()
+    {
+        static const bool on = [] {
+            const char *v = std::getenv("PS2X_GS_THREAD");
+            return !(v && v[0] == '0');
+        }();
+        return on;
+    }
+
+    bool active()
+    {
+        return enabledSetting() && !s3gfx::enabled();
+    }
+
+    void setProcessor(std::function<void(const uint8_t *, uint32_t)> fn)
+    {
+        g_process = std::move(fn);
+    }
+
+    void enqueue(const uint8_t *data, uint32_t size)
+    {
+        if (!g_started.load(std::memory_order_acquire))
+        {
+            g_started.store(true, std::memory_order_release);
+            std::fprintf(stderr, "[gs] GS thread on (PS2X_GS_THREAD=0 to turn off)\n");
+            std::thread(workerMain).detach();
+        }
+        std::vector<uint8_t> packet;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            if (!g_pool.empty())
+            {
+                packet = std::move(g_pool.back());
+                g_pool.pop_back();
+            }
+        }
+        packet.assign(data, data + size);
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_queue.push_back(std::move(packet));
+            g_submitted.fetch_add(1, std::memory_order_acq_rel);
+        }
+        if (g_workerSleeping.load(std::memory_order_acquire))
+            g_workCv.notify_one();
+    }
+
+    bool pending()
+    {
+        return g_completed.load(std::memory_order_acquire) != g_submitted.load(std::memory_order_acquire);
+    }
+
+    // Waits until every queued packet has been processed (no-op on the GS thread itself).
+    void drain()
+    {
+        if (!pending() || std::this_thread::get_id() == g_workerId)
+            return;
+        for (uint32_t n = 0; n < 4096u && pending(); ++n)
+            if ((n & 63u) == 63u)
+                std::this_thread::yield();
+        if (!pending())
+            return;
+        std::unique_lock<std::mutex> lock(g_mutex);
+        g_idleCv.wait(lock, [] { return !pending(); });
+    }
+}
+
+// s3recomp: fast-forward, a testing aid for getting through cutscenes. F on the keyboard (or clicking
+// both sticks) turns it on and off. While on, the game's clock (vblanks, timers, alarms) runs
+// PS2X_FF_SPEED times faster (default 4) and only every PS2X_FF_DRAW_EVERY-th frame (default 4) is
+// drawn: the others skip VU1 programs and GS drawing, which is most of the work per frame. Texture
+// uploads and GS register writes still happen, so drawn frames have what they need.
+namespace s3ff
+{
+    std::atomic<bool> active{false};          // fast-forward on
+    std::atomic<bool> skipDraw{false};        // the frame being built now is not drawn
+    std::atomic<bool> shownFrameDrawn{true};  // the frame on screen was drawn (else keep the last picture)
+    static uint64_t s_lastDisp = ~0ull;       // EE thread only
+    static uint64_t s_frame = 0;
+    static std::atomic<uint64_t> s_lastFrameNs{0};
+
+    static uint32_t envCount(const char *name, uint32_t fallback)
+    {
+        const char *v = std::getenv(name);
+        const unsigned long n = v ? std::strtoul(v, nullptr, 10) : 0ul;
+        return n >= 1ul && n <= 64ul ? static_cast<uint32_t>(n) : fallback;
+    }
+    uint32_t speed()
+    {
+        static const uint32_t s = envCount("PS2X_FF_SPEED", 4u);
+        return s;
+    }
+    static uint32_t drawEvery()
+    {
+        static const uint32_t n = envCount("PS2X_FF_DRAW_EVERY", 4u);
+        return n;
+    }
+    static uint64_t nowNs()
+    {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count());
+    }
+
+    // Called on the game thread with the current display buffer registers: a change means the game
+    // showed a new frame and is about to build the next one.
+    void checkFrame(uint64_t disp)
+    {
+        if (disp == s_lastDisp)
+            return;
+        s3gsq::drain(); // packets of the finished frame use its own skip setting
+        s_lastDisp = disp;
+        s_lastFrameNs.store(nowNs(), std::memory_order_relaxed);
+        shownFrameDrawn.store(!skipDraw.load(std::memory_order_relaxed), std::memory_order_release);
+        ++s_frame;
+        const bool on = active.load(std::memory_order_acquire);
+        skipDraw.store(on && (s_frame % drawEvery()) != 0u, std::memory_order_release);
+    }
+
+    // Called at each vblank: if the game stops flipping buffers (a still screen), draw again so the
+    // screen does not stay frozen.
+    void onVBlank(uint64_t disp)
+    {
+        checkFrame(disp);
+        if (skipDraw.load(std::memory_order_relaxed) &&
+            nowNs() - s_lastFrameNs.load(std::memory_order_relaxed) > 250000000ull)
+        {
+            skipDraw.store(false, std::memory_order_release);
+            shownFrameDrawn.store(true, std::memory_order_release);
+        }
+    }
+
+    void setActive(bool on)
+    {
+        active.store(on, std::memory_order_release);
+        if (!on)
+            skipDraw.store(false, std::memory_order_release);
+        std::fprintf(stderr, "[ff] fast-forward %s (x%u, drawing 1 frame in %u)\n", on ? "on" : "off", speed(), drawEvery());
+    }
+}
+
+// s3recomp: performance counters for the FPS overlay and the periodic [perf] log line.
+namespace s3perf
+{
+    std::atomic<uint64_t> vu1Ns{0};      // VU1 microprogram execution (game thread)
+    std::atomic<uint64_t> gsNs{0};       // GIF packet processing incl. GS drawing (game thread)
+    std::atomic<uint64_t> gsInVu1Ns{0};  // part of gsNs spent inside VU1 XGKICKs
+    std::atomic<uint64_t> frames{0};     // distinct displayed frames (front-buffer flips)
+    std::atomic<uint64_t> vu1Cycles{0};       // VU1 cycles run
+    std::atomic<uint64_t> vu1NativeCycles{0}; // of which in generated (native) VU1 programs
+    std::atomic<uint64_t> iopNs{0};           // IOP emulation run from EE time accounting (game thread)
+    std::atomic<uint64_t> eeSwitches{0};      // EE thread switches through the dispatcher
+    std::atomic<uint64_t> eeIdleNs{0};        // game thread waiting with no guest thread to run
+    thread_local bool inVu1 = false;
+    inline uint64_t nowNs()
+    {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count());
+    }
+}
+
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
@@ -444,11 +755,21 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         }
         ++s_uploadDebugCount;
     });
+    if (displayFbp != s_lastDisplayFbp)
+        s3perf::frames.fetch_add(1u, std::memory_order_relaxed);
     s_lastDisplayFbp = displayFbp;
     s_lastSourceFbp = sourceFbp;
     s_lastPreferred = usedPreferredDisplaySource;
     s_lastWidth = width;
     s_lastHeight = height;
+
+    // s3recomp: during fast-forward, frames that were not drawn keep the last drawn picture on screen.
+    if (!s3ff::shownFrameDrawn.load(std::memory_order_acquire) && s_hasUploadedFrame)
+    {
+        outWidth = width;
+        outHeight = height;
+        return;
+    }
 
     std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
     if (!s_scratch.empty() && width != 0u && height != 0u)
@@ -607,7 +928,9 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
 
 void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
 {
+    const uint64_t t0 = s3perf::nowNs();
     m_iopSubsystem->runEeCycles(eeCycles);
+    s3perf::iopNs.fetch_add(s3perf::nowNs() - t0, std::memory_order_relaxed);
 }
 
 void PS2Runtime::resetIop()
@@ -665,48 +988,187 @@ bool PS2Runtime::syncCoreSubsystems()
     }
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
+    {
+        // s3recomp: draw on the GPU with Vulkan unless PS2X_GS_BACKEND=cpu, falling back to the
+        // software rasteriser when no suitable Vulkan device is present.
+        static bool s_rendererChosen = false;
+        if (!s_rendererChosen)
+        {
+            s_rendererChosen = true;
+            const char *choice = std::getenv("PS2X_GS_BACKEND");
+            if (choice && (choice[0] == 'c' || choice[0] == 'C'))
+            {
+                std::fprintf(stderr, "[gs] software renderer (PS2X_GS_BACKEND=cpu)\n");
+            }
+            else
+            {
+                std::string why;
+                std::unique_ptr<GSRasterBackend> vk = GSVulkanBackend::TryCreate(why);
+                if (vk)
+                    m_gs.setRasterBackend(std::move(vk));
+                else
+                    std::fprintf(stderr, "[gs] Vulkan renderer unavailable (%s); using the software renderer\n", why.c_str());
+            }
+        }
+    }
+    s3gsq::setProcessor([this](const uint8_t *data, uint32_t size)
+                        {
+                            const uint64_t t0 = s3perf::nowNs();
+                            m_gs.processGIFPacket(data, size);
+                            const uint64_t dt = s3perf::nowNs() - t0;
+                            s3perf::gsNs.fetch_add(dt, std::memory_order_relaxed);
+                            if (s3perf::inVu1)
+                                s3perf::gsInVu1Ns.fetch_add(dt, std::memory_order_relaxed); });
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
-                                    { m_gs.processGIFPacket(data, size); });
+                                    {
+                                        if (s3gsq::active())
+                                        {
+                                            s3gsq::enqueue(data, size);
+                                            return;
+                                        }
+                                        const uint64_t t0 = s3perf::nowNs();
+                                        m_gs.processGIFPacket(data, size);
+                                        const uint64_t dt = s3perf::nowNs() - t0;
+                                        s3perf::gsNs.fetch_add(dt, std::memory_order_relaxed);
+                                        if (s3perf::inVu1)
+                                            s3perf::gsInVu1Ns.fetch_add(dt, std::memory_order_relaxed); });
     m_memory.setGifArbiter(&m_gifArbiter);
+    {
+        // s3recomp: graphics worker hooks (see s3gfx in ps2_memory.cpp).
+        static PS2Runtime *s_gfxRuntime = nullptr;
+        s_gfxRuntime = this;
+        s3gfx::g_wakeEe = [] {
+            if (s_gfxRuntime && s_gfxRuntime->m_eeScheduler)
+            {
+                EeEvent event{};
+                event.type = EeEventType::Dmac;
+                s_gfxRuntime->m_eeScheduler->postEvent(event);
+            }
+        };
+        s3gfx::g_captureFbrst = []() -> uint32_t {
+            R5900Context *c = s_gfxRuntime && s_gfxRuntime->m_eeScheduler ? s_gfxRuntime->m_eeScheduler->currentContext() : nullptr;
+            return c ? c->vu0_fbrst : (s_gfxRuntime ? s_gfxRuntime->m_cpuContext.vu0_fbrst : 0u);
+        };
+        s3gfx::g_applyVpuStat = [](uint32_t bits) {
+            R5900Context *c = s_gfxRuntime && s_gfxRuntime->m_eeScheduler ? s_gfxRuntime->m_eeScheduler->currentContext() : nullptr;
+            if (!c && s_gfxRuntime)
+                c = &s_gfxRuntime->m_cpuContext;
+            if (c)
+                c->vu0_vpu_stat = (c->vu0_vpu_stat & ~0x0600u) | bits;
+        };
+        if (s3gfx::enabled())
+            std::fprintf(stderr, "[gfx] VIF1/VU1/GS run on a separate thread (PS2X_GFX_THREAD=1)\n");
+    }
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
-                                     if (!cpuContext)
+                                     // s3recomp: fast-forward skips VU1 programs on frames that are not drawn.
+                                     if (s3ff::skipDraw.load(std::memory_order_relaxed))
+                                         return;
+                                     // s3recomp: on the graphics worker the EE context belongs to another
+                                     // thread: FBRST comes from the kick and VPU_STAT is applied at completion.
+                                     uint32_t fbrst = 0u;
+                                     R5900Context *cpuContext = nullptr;
+                                     if (!s3gfx::jobFbrst(fbrst))
                                      {
-                                         cpuContext = &m_cpuContext;
+                                         cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                         if (!cpuContext)
+                                         {
+                                             cpuContext = &m_cpuContext;
+                                         }
+                                         fbrst = cpuContext->vu0_fbrst;
                                      }
                                      m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+                                         (fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
-                                     m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
-                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                   m_gs, &m_memory, startPC, top, itop, 65536);
-                                     cpuContext->vu0_vpu_stat =
-                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
-                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+                                         (fbrst & (1u << 11)) != 0u;
+                                     // s3recomp debug: PS2X_VU1_DUMP=<trigger file>; touching it dumps the next 12 MSCALs.
+                                     static const char *vuTrigger = std::getenv("PS2X_VU1_DUMP");
+                                     static int vuDumpLeft = 0;
+                                     static int vuDumpIndex = 0;
+                                     static uint64_t vuCalls = 0;
+                                     if (vuTrigger && vuDumpLeft == 0 && (++vuCalls % 64u) == 0u)
+                                     {
+                                         if (FILE *t = std::fopen(vuTrigger, "rb"))
+                                         {
+                                             std::fclose(t);
+                                             std::remove(vuTrigger);
+                                             vuDumpLeft = 12;
+                                             vuDumpIndex = 0;
+                                         }
+                                     }
+                                     FILE *vuDump = nullptr;
+                                     if (vuDumpLeft > 0)
+                                     {
+                                         const std::string path = std::string(vuTrigger) + "." + std::to_string(vuDumpIndex++) + ".bin";
+                                         vuDump = std::fopen(path.c_str(), "wb");
+                                         --vuDumpLeft;
+                                         if (vuDump)
+                                         {
+                                             const uint32_t hdr[4] = {startPC, top, itop, 0x31555653u};
+                                             std::fwrite(hdr, 4, 4, vuDump);
+                                             std::fwrite(&m_vu1.state(), sizeof(VU1State), 1, vuDump);
+                                             std::fwrite(m_memory.getVU1Code(), 1, PS2_VU1_CODE_SIZE, vuDump);
+                                             std::fwrite(m_memory.getVU1Data(), 1, PS2_VU1_DATA_SIZE, vuDump);
+                                         }
+                                     }
+                                     s3vucap::maybeCapture(0u, startPC, top, itop, m_vu1.state(), m_memory.getVU1Code(), m_memory.getVU1Data());
+                                     if (s3vu1::useReference())
+                                         m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                       m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                       m_gs, &m_memory, startPC, top, itop, 65536);
+                                     else
+                                         s3vu1::fast(m_vu1).execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                                    m_gs, &m_memory, startPC, top, itop, 65536);
+                                     if (vuDump)
+                                     {
+                                         std::fwrite(&m_vu1.state(), sizeof(VU1State), 1, vuDump);
+                                         std::fwrite(m_memory.getVU1Data(), 1, PS2_VU1_DATA_SIZE, vuDump);
+                                         std::fclose(vuDump);
+                                     }
+                                     const uint32_t vpuBits = (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+                                                              (m_vu1.state().stoppedByT ? 0x0400u : 0u);
+                                     if (!s3gfx::jobSetVpuStat(vpuBits))
+                                         cpuContext->vu0_vpu_stat = (cpuContext->vu0_vpu_stat & ~0x0600u) | vpuBits; });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
-                                     if (!cpuContext)
+                                     // s3recomp: fast-forward skips VU1 programs on frames that are not drawn.
+                                     if (s3ff::skipDraw.load(std::memory_order_relaxed))
+                                         return;
+                                     // s3recomp: on the graphics worker the EE context belongs to another
+                                     // thread: FBRST comes from the kick and VPU_STAT is applied at completion.
+                                     uint32_t fbrst = 0u;
+                                     R5900Context *cpuContext = nullptr;
+                                     if (!s3gfx::jobFbrst(fbrst))
                                      {
-                                         cpuContext = &m_cpuContext;
+                                         cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                         if (!cpuContext)
+                                         {
+                                             cpuContext = &m_cpuContext;
+                                         }
+                                         fbrst = cpuContext->vu0_fbrst;
                                      }
                                      m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+                                         (fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
-                                     m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
-                                                  m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                  m_gs, &m_memory, top, itop, 65536);
-                                     cpuContext->vu0_vpu_stat =
-                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
-                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+                                         (fbrst & (1u << 11)) != 0u;
+                                     s3vucap::maybeCapture(1u, m_vu1.state().pc, top, itop, m_vu1.state(), m_memory.getVU1Code(), m_memory.getVU1Data());
+                                     if (s3vu1::useReference())
+                                         m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                      m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                      m_gs, &m_memory, top, itop, 65536);
+                                     else
+                                         s3vu1::fast(m_vu1).resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                                   m_gs, &m_memory, top, itop, 65536);
+                                     const uint32_t vpuBits = (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+                                                              (m_vu1.state().stoppedByT ? 0x0400u : 0u);
+                                     if (!s3gfx::jobSetVpuStat(vpuBits))
+                                         cpuContext->vu0_vpu_stat = (cpuContext->vu0_vpu_stat & ~0x0600u) | vpuBits; });
     resetIop();
     m_vu0.reset();
     m_vu1.reset();
+    s3vu1::fast(m_vu1).reset();
 
     m_boundRdram = rdram;
     m_boundGSVram = gsVram;
@@ -736,6 +1198,7 @@ bool PS2Runtime::initialize(const char *title)
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
+        SetExitKey(KEY_NULL); // Escape is a pad button (Circle), not "close the game"
         SetTargetFPS(60);
         if (m_debugUiInitCallback)
         {
@@ -974,6 +1437,15 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
         const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
         m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
         m_asyncCallbackStackTop = PS2_RAM_SIZE;
+        // s3recomp: the top of RAM is where games put their main thread stack (SetupThread),
+        // so interrupt/callback stacks carved from there trampled live stack frames. Use the
+        // EE kernel reserve at 0x80000-0x100000 instead, which games never touch, whenever
+        // the executable is loaded above it.
+        if (moduleBase != std::numeric_limits<uint32_t>::max() && moduleBase >= 0x00100000u)
+        {
+            m_asyncCallbackStackFloor = 0x00080000u;
+            m_asyncCallbackStackTop = 0x00100000u;
+        }
     }
 
     LoadedModule module;
@@ -1109,10 +1581,15 @@ bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
     return replaceFunction(address, func);
 }
 
+PS2Runtime::RecompiledFunction s3_find_overlay_function(const uint8_t *rdram, uint32_t address);
+
 bool PS2Runtime::hasFunction(uint32_t address) const
 {
     uint32_t slot = 0u;
-    return generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr;
+    if (generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr)
+        return true;
+    // s3recomp: code loaded from disc at run time (recompiled overlays).
+    return s3_find_overlay_function(const_cast<PS2Memory &>(m_memory).getRDRAM(), address) != nullptr;
 }
 
 const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
@@ -1146,6 +1623,10 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
         {
             return fn;
         }
+    }
+    if (RecompiledFunction fn = s3_find_overlay_function(m_memory.getRDRAM(), address))
+    {
+        return fn;
     }
 
     std::cerr << "Error: No exact recompiled function for guest PC 0x" << std::hex << address
@@ -1324,6 +1805,37 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
         }
     }
 
+    // s3recomp: keep a snapshot of EE RAM from the first miss so the module that should hold the
+    // target can be identified from the bytes around it (logs/eeram-missing-<target>.bin).
+    static std::mutex s_dumpMutex;
+    static uint32_t s_dumped[3] = {};
+    static uint32_t s_dumpCount = 0;
+    bool dumpNow = false;
+    if (rdram)
+    {
+        std::lock_guard<std::mutex> lock(s_dumpMutex);
+        const uint32_t page = targetPc & ~0xFFFFu;
+        bool seen = false;
+        for (uint32_t i = 0; i < s_dumpCount; ++i)
+            seen |= s_dumped[i] == page;
+        if (!seen && s_dumpCount < 3)
+        {
+            s_dumped[s_dumpCount++] = page;
+            dumpNow = true;
+        }
+    }
+    if (dumpNow)
+    {
+        char name[64];
+        std::snprintf(name, sizeof(name), "logs/eeram-missing-%08x.bin", targetPc);
+        if (FILE *f = std::fopen(name, "wb"))
+        {
+            std::fwrite(rdram, 1, PS2_RAM_SIZE, f);
+            std::fclose(f);
+            std::cerr << "[guest-branch:missing-target] EE RAM saved to " << name << std::endl;
+        }
+    }
+
     if (firstReport && policy == MissingFunctionPolicy::BreakOnce)
     {
 #if defined(_MSC_VER)
@@ -1342,6 +1854,8 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     }
 }
 
+extern thread_local bool t_s3Unwinding; // defined with eeCheckpointDue below
+
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      R5900Context *ctx,
                                      uint32_t targetPc,
@@ -1358,6 +1872,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // this charge bounds straight-line call chains that have no local loop.
     if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
     {
+        t_s3Unwinding = true;
         return false;
     }
 
@@ -1369,6 +1884,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
 
         ctx->pc = targetPc;
+        t_s3Unwinding = true;
         return false;
     }
 
@@ -1378,11 +1894,23 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
         const MissingFunctionPolicy policy = missingFunctionPolicy();
 
-        if (policy == MissingFunctionPolicy::SkipCallDebug && isCall)
+        // s3recomp: a call into overlay code that was not found when the game was built (callbacks
+        // are the usual case) is skipped with v0/v1 = 0 instead of ending the game thread. The game
+        // keeps running - usually with something missing on screen - and the log names the target.
+        const bool s3SkipOverlayCall = targetPc < 0x01600000u && targetPc >= 0x00100000u;
+        if ((policy == MissingFunctionPolicy::SkipCallDebug || s3SkipOverlayCall) && isCall)
         {
+            static std::atomic<uint32_t> s_skipped{0};
+            const uint32_t n = s_skipped.fetch_add(1, std::memory_order_relaxed);
+            if (n < 32 || (n & (n - 1)) == 0)
+                std::cerr << "[guest-branch:skip] call 0x" << std::hex << sourcePc << " -> 0x" << targetPc
+                          << " skipped (not recompiled), count=" << std::dec << (n + 1) << std::endl;
+            ctx->r[2] = _mm_setzero_si128();
+            ctx->r[3] = _mm_setzero_si128();
             ctx->pc = fallthroughPc;
             return true;
         }
+        t_s3Unwinding = true;
 
         if (policy == MissingFunctionPolicy::ContinueToTarget)
         {
@@ -1396,16 +1924,46 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     RecompiledFunction targetFn = lookupFunction(targetPc);
     const uint32_t entryPc = ctx->pc;
+    // s3recomp: callee-saved registers (s0-s7, sp, fp) must survive a call. A violation here is
+    // logged with both addresses: it pins down register or stack corruption at the call that
+    // caused it instead of the crash that follows much later.
+    uint32_t saved[10];
+    for (int i = 0; i < 8; ++i)
+        saved[i] = GPR_U32(ctx, 16 + i);
+    saved[8] = GPR_U32(ctx, 29);
+    saved[9] = GPR_U32(ctx, 30);
+    t_s3Unwinding = false; // any unwind that starts inside this call sets it again
     targetFn(rdram, ctx, this);
 
-    if (isStopRequested() || ctx->pc == 0u)
+    if (isStopRequested() || ctx->pc == 0u || t_s3Unwinding)
     {
         return false;
     }
 
     if (ctx->pc == entryPc)
     {
-        ctx->pc = fallthroughPc;
+        ctx->pc = fallthroughPc; // native stubs leave ctx->pc alone
+    }
+
+    if (ctx->pc == fallthroughPc)
+    {
+        static std::atomic<int> s_reports{0};
+        bool bad = GPR_U32(ctx, 29) != saved[8] || GPR_U32(ctx, 30) != saved[9];
+        for (int i = 0; i < 8 && !bad; ++i)
+            bad = GPR_U32(ctx, 16 + i) != saved[i];
+        if (bad && s_reports.fetch_add(1, std::memory_order_relaxed) < 24)
+        {
+            std::fprintf(stderr, "[abi-check] call 0x%x -> 0x%x (%s) returned with changed callee-saved registers:", sourcePc,
+                         targetPc, debugName ? debugName : "?");
+            for (int i = 0; i < 8; ++i)
+                if (GPR_U32(ctx, 16 + i) != saved[i])
+                    std::fprintf(stderr, " s%d %08x->%08x", i, saved[i], GPR_U32(ctx, 16 + i));
+            if (GPR_U32(ctx, 29) != saved[8])
+                std::fprintf(stderr, " sp %08x->%08x", saved[8], GPR_U32(ctx, 29));
+            if (GPR_U32(ctx, 30) != saved[9])
+                std::fprintf(stderr, " fp %08x->%08x", saved[9], GPR_U32(ctx, 30));
+            std::fprintf(stderr, " ra=%08x\n", GPR_U32(ctx, 31));
+        }
     }
 
     return ctx->pc == fallthroughPc;
@@ -1469,6 +2027,28 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
                                    ? encodedSyscallId
                                    : getRegU32(ctx, 3); // $v1 / $3 is the EE kernel syscall number
 
+    {
+        // s3recomp: optional syscall trace for headless boot triage (PS2X_TRACE_SYSCALLS=1)
+        static const bool s_traceSyscalls = s3_env_flag("PS2X_TRACE_SYSCALLS");
+        if (s_traceSyscalls)
+        {
+            static thread_local char idName[16];
+            std::snprintf(idName, sizeof(idName), "id=0x%x", syscallId);
+            // Names must be stable pointers for repeat detection: intern per syscall id.
+            static std::mutex s_internMutex;
+            static std::map<uint32_t, std::string> s_interned;
+            const char *stable = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(s_internMutex);
+                auto &slot = s_interned[syscallId];
+                if (slot.empty())
+                    slot = idName;
+                stable = slot.c_str();
+            }
+            s3_trace_emit("[sc]", stable, getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 31));
+        }
+    }
+
     if (ps2_syscalls::dispatchNumericSyscall(syscallId, rdram, ctx, this))
     {
         return;
@@ -1487,7 +2067,10 @@ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
 {
     for (uint32_t cause : m_memory.consumeCompletedDmacCauses())
     {
-        ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
+        if (cause & 0x80000000u) // INTC cause queued by a device (e.g. the IPU)
+            eeScheduler().dispatchIrq(false, cause & 0xFFu);
+        else
+            ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
     }
 }
 
@@ -1629,11 +2212,12 @@ uint32_t PS2Runtime::clampGuestHeapBase(uint32_t guestBase) const
 uint32_t PS2Runtime::clampGuestHeapLimit(uint32_t guestLimit) const
 {
     const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-    if (guestLimit == 0u || guestLimit > hardLimit)
+    if (guestLimit == 0u)
     {
         return hardLimit;
     }
-    return guestLimit;
+    // s3recomp: an explicit limit (from SetupHeap) may reach the main thread's stack.
+    return std::min(guestLimit, PS2_RAM_SIZE);
 }
 
 void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
@@ -2209,9 +2793,21 @@ void PS2Runtime::postEeEvent(EeEvent event)
     m_eeScheduler->postEvent(event);
 }
 
+// s3recomp: set while generated code is unwinding back to the EE scheduler (a checkpoint, or a
+// jump that leaves the host call chain). dispatchGuestBranch must then pass the unwind on instead
+// of guessing from ctx->pc: a checkpoint taken at the entry of a recursive call leaves ctx->pc
+// equal to the outer call's target, which looked like "the callee returned" and resumed the
+// caller with the callee's registers and stack (the Suikoden III scene-change crashes in the
+// object tree walk 0x18BCFE0 -> 0x16CB808 -> 0x18BCFE0).
+thread_local bool t_s3Unwinding = false;
+void s3ClearUnwinding() noexcept { t_s3Unwinding = false; }
+
 bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
 {
-    return m_eeScheduler->checkpointDue(cycles);
+    const bool due = m_eeScheduler->checkpointDue(cycles);
+    if (due)
+        t_s3Unwinding = true;
+    return due;
 }
 
 [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)
@@ -2360,13 +2956,22 @@ void PS2Runtime::run()
     // A blank image to use as a framebuffer
     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
+    {
+        // Smooth scaling to the window by default, closer to how a PS2 looks on a TV;
+        // PS2X_SCALE_FILTER=point keeps hard pixels.
+        const char *filter = std::getenv("PS2X_SCALE_FILTER");
+        SetTextureFilter(frameTex, (filter && (filter[0] == 'p' || filter[0] == 'P')) ? TEXTURE_FILTER_POINT
+                                                                                    : TEXTURE_FILTER_BILINEAR);
+    }
     UnloadImage(blank);
 
     std::atomic<bool> gameThreadFinished{false};
+    s3prof::registerThread("presenter");
 
     std::thread gameThread([&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
+        s3prof::registerThread("game");
         try
         {
             m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
@@ -2420,6 +3025,69 @@ void PS2Runtime::run()
 
             }
         });
+        // s3recomp: PS2X_DUMP_THREADS=1 prints every guest thread's state every ~5 seconds.
+        {
+            static const bool dumpThreads = s3_env_flag("PS2X_DUMP_THREADS");
+            static uint64_t dumpTick = 0;
+            if (dumpThreads && (++dumpTick % 300u) == 0u)
+            {
+                const auto snap = m_eeScheduler->snapshot();
+                std::fprintf(stderr, "[threads] t=%llu running=%d\n", static_cast<unsigned long long>(dumpTick), snap.runningThreadId);
+                for (const auto &t : snap.threads)
+                    std::fprintf(stderr, "[thread] id=%d st=%d wait=%d wid=%d pc=0x%x ra=0x%x sp=0x%x entry=0x%x pri=%d susp=%d inv=%u\n",
+                                 t.id, static_cast<int>(t.status), static_cast<int>(t.waitReason), t.waitId, t.pc, t.ra, t.sp,
+                                 t.entry, t.currentPriority, t.suspendCount, t.invocationDepth);
+                for (const auto &sm : snap.semaphores)
+                    if (sm.waiters)
+                        std::fprintf(stderr, "[sema] id=%d count=%d max=%d waiters=%u\n", sm.id, sm.count, sm.maxCount, sm.waiters);
+                for (const auto &ef : snap.eventFlags)
+                    if (ef.waiters)
+                        std::fprintf(stderr, "[evf] id=%d bits=0x%x waiters=%u\n", ef.id, ef.bits, ef.waiters);
+                // PS2X_WATCH=addr,addr,... prints guest words alongside the thread dump.
+                static const char *watch = std::getenv("PS2X_WATCH");
+                if (watch && *watch)
+                {
+                    std::string list(watch);
+                    size_t pos = 0;
+                    while (pos < list.size())
+                    {
+                        size_t end = list.find(',', pos);
+                        if (end == std::string::npos)
+                            end = list.size();
+                        const uint32_t addr = static_cast<uint32_t>(std::strtoul(list.substr(pos, end - pos).c_str(), nullptr, 16)) & 0x1FFFFFFCu;
+                        if (addr + 4u <= PS2_RAM_SIZE)
+                        {
+                            uint32_t value = 0;
+                            std::memcpy(&value, m_memory.getRDRAM() + addr, 4);
+                            std::fprintf(stderr, "[watch] 0x%08x = 0x%08x\n", addr, value);
+                        }
+                        else if (addr >= 0x10000000u && addr < 0x10010000u)
+                        {
+                            std::fprintf(stderr, "[watch] io 0x%08x = 0x%08x\n", addr, m_memory.readIORegister(addr));
+                        }
+                        pos = end + 1;
+                    }
+                }
+            }
+        }
+        {
+            // s3recomp: fast-forward toggle: F, or clicking both sticks together.
+            static bool s_chordWasDown = false;
+            bool chordDown = false;
+            for (int pad = 0; pad < 4; ++pad)
+                if (IsGamepadAvailable(pad) && IsGamepadButtonDown(pad, GAMEPAD_BUTTON_LEFT_THUMB) &&
+                    IsGamepadButtonDown(pad, GAMEPAD_BUTTON_RIGHT_THUMB))
+                    chordDown = true;
+            // The key queue also catches a tap shorter than one frame.
+            bool fTapped = IsKeyPressed(KEY_F);
+            for (int key = GetKeyPressed(); key != 0; key = GetKeyPressed())
+                if (key == KEY_F)
+                    fTapped = true;
+            const bool toggle = fTapped || (chordDown && !s_chordWasDown);
+            s_chordWasDown = chordDown;
+            if (toggle)
+                s3ff::setActive(!s3ff::active.load(std::memory_order_acquire));
+        }
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         UploadFrame(frameTex, this, presentWidth, presentHeight);
@@ -2430,9 +3098,29 @@ void PS2Runtime::run()
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
         const float screenWidth = static_cast<float>(GetScreenWidth());
         const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
-        const float dstWidth = srcWidth * scale;
-        const float dstHeight = srcHeight * scale;
+        // A PS2 stretches whatever width it renders (512, 640, ...) across a 4:3 TV picture.
+        // PS2X_ASPECT=native shows square pixels instead; PS2X_ASPECT=stretch fills the window.
+        static const int aspectMode = [] {
+            const char *v = std::getenv("PS2X_ASPECT");
+            if (v && (v[0] == 'n' || v[0] == 'N'))
+                return 1;
+            if (v && (v[0] == 's' || v[0] == 'S'))
+                return 2;
+            return 0;
+        }();
+        float dstWidth = screenWidth, dstHeight = screenHeight;
+        if (aspectMode == 1)
+        {
+            const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
+            dstWidth = srcWidth * scale;
+            dstHeight = srcHeight * scale;
+        }
+        else if (aspectMode == 0)
+        {
+            const float scale = std::min(screenWidth / 4.0f, screenHeight / 3.0f);
+            dstWidth = 4.0f * scale;
+            dstHeight = 3.0f * scale;
+        }
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
         const Rectangle dstRect{
             (screenWidth - dstWidth) * 0.5f,
@@ -2440,6 +3128,116 @@ void PS2Runtime::run()
             dstWidth,
             dstHeight};
         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        {
+            // s3recomp: once a second, sample the counters; every 5 s write a [perf] line to the log.
+            // PS2X_SHOW_FPS=1 draws them in the corner of the window.
+            static const bool showFps = [] {
+                const char *v = std::getenv("PS2X_SHOW_FPS");
+                return v && v[0] == '1';
+            }();
+            static uint64_t lastNs = s3perf::nowNs(), lastLogNs = lastNs;
+            static uint64_t lastFrames = 0, lastVsync = 0, lastVu = 0, lastGs = 0, lastGsVu = 0, presents = 0;
+            static uint64_t logFrames = 0, logVsync = 0, logVu = 0, logGs = 0, logGsVu = 0, logPresents = 0;
+            static uint64_t logVuCycles = 0, logVuNative = 0, logIop = 0, logSwitches = 0, logKick = 0, logOverlap = 0, logSyncs = 0;
+            static char overlay[160] = "";
+            ++presents;
+            const uint64_t now = s3perf::nowNs();
+            if (now - lastNs >= 1000000000ull)
+            {
+                const double secs = double(now - lastNs) / 1e9;
+                const uint64_t frames = s3perf::frames.load(std::memory_order_relaxed);
+                const uint64_t vsync = eeScheduler().currentVSyncTick();
+                const uint64_t vu = s3perf::vu1Ns.load(std::memory_order_relaxed);
+                const uint64_t gs = s3perf::gsNs.load(std::memory_order_relaxed);
+                const uint64_t gsvu = s3perf::gsInVu1Ns.load(std::memory_order_relaxed);
+                const double wall = double(now - lastNs);
+                const double vuPct = 100.0 * double((vu - lastVu) - (gsvu - lastGsVu)) / wall;
+                const double gsPct = 100.0 * double(gs - lastGs) / wall;
+                std::snprintf(overlay, sizeof(overlay), "FPS %.1f  vsync %.0f/60  VU1 %.0f%%  GS %.0f%%",
+                              double(frames - lastFrames) / secs, double(vsync - lastVsync) / secs, vuPct, gsPct);
+                lastNs = now;
+                lastFrames = frames; lastVsync = vsync; lastVu = vu; lastGs = gs; lastGsVu = gsvu;
+                if (now - lastLogNs >= 5000000000ull)
+                {
+                    const double ls = double(now - lastLogNs) / 1e9, lw = double(now - lastLogNs);
+                    const double lvu = 100.0 * double((vu - logVu) - (gsvu - logGsVu)) / lw;
+                    const double lgs = 100.0 * double(gs - logGs) / lw;
+                    const uint64_t vuCycles = s3perf::vu1Cycles.load(std::memory_order_relaxed);
+                    const uint64_t vuNative = s3perf::vu1NativeCycles.load(std::memory_order_relaxed);
+                    const double nativePct = vuCycles > logVuCycles
+                                                 ? 100.0 * double(vuNative - logVuNative) / double(vuCycles - logVuCycles)
+                                                 : 0.0;
+                    const uint64_t iop = s3perf::iopNs.load(std::memory_order_relaxed);
+                    const uint64_t switches = s3perf::eeSwitches.load(std::memory_order_relaxed);
+                    const double liop = 100.0 * double(iop - logIop) / lw;
+                    static uint64_t logIdle = 0;
+                    const uint64_t idle = s3perf::eeIdleNs.load(std::memory_order_relaxed);
+                    const double lidle = 100.0 * double(idle - logIdle) / lw;
+                    logIdle = idle;
+                    std::fprintf(stderr, "[perf] fps=%.1f vsync=%.1f/s present=%.1f/s game-thread: vu1=%.0f%% gs=%.0f%% idle=%.0f%% other=%.0f%% (iop %.0f%%) vu1-native=%.0f%% ee-switches=%.0f/s\n",
+                                 double(frames - logFrames) / ls, double(vsync - logVsync) / ls, double(presents - logPresents) / ls,
+                                 lvu, lgs, lidle, std::max(0.0, 100.0 - lvu - lgs - lidle), liop, nativePct, double(switches - logSwitches) / ls);
+                    logIop = iop;
+                    logSwitches = switches;
+                    {
+                        const uint64_t kick = s3gfx::kickNs.load(), overlap = s3gfx::overlapNs.load(), syncs = s3gfx::syncs.load();
+                        static uint64_t logBusy = 0, logWait = 0;
+                        const uint64_t busy = s3gfx::workerBusyNs.load(), wait = s3gfx::syncWaitNs.load();
+                        std::fprintf(stderr, "[gfx] %s dma-processing=%.1fms/s overlappable=%.1fms/s worker-busy=%.0f%% ee-waiting=%.0f%% syncs=%.0f/s reasons(dstat,chan,vifgif,gs,vu1,stub)=%llu,%llu,%llu,%llu,%llu,%llu\n",
+                                     s3gfx::enabled() ? "threaded" : "inline",
+                                     double(kick - logKick) / 1e6 / ls, double(overlap - logOverlap) / 1e6 / ls,
+                                     100.0 * double(busy - logBusy) / lw, 100.0 * double(wait - logWait) / lw, double(syncs - logSyncs) / ls,
+                                     (unsigned long long)s3gfx::syncReason[0].load(), (unsigned long long)s3gfx::syncReason[1].load(),
+                                     (unsigned long long)s3gfx::syncReason[2].load(), (unsigned long long)s3gfx::syncReason[3].load(),
+                                     (unsigned long long)s3gfx::syncReason[4].load(), (unsigned long long)s3gfx::syncReason[5].load());
+                        logKick = kick; logOverlap = overlap; logSyncs = syncs; logBusy = busy; logWait = wait;
+                        {
+                            static uint64_t lastStat[16] = {}, lastStub[8] = {};
+                            uint64_t st[16], sb[8];
+                            for (int k = 0; k < 16; ++k) st[k] = s3gfx::stat[k].load();
+                            for (int k = 0; k < 8; ++k) sb[k] = s3gfx::stubCalls[k].load();
+                            auto rate = [&](int k) { return double(st[k] - lastStat[k]) / ls; };
+                            auto srate = [&](int k) { return double(sb[k] - lastStub[k]) / ls; };
+                            const uint64_t applied = st[2] - lastStat[2];
+                            std::fprintf(stderr, "[gfx] per-second: kicks vif1=%.0f gif=%.0f completions=%.0f (event %.0f, sync %.0f, poll %.0f) latency avg=%.2fms max=%.2fms | reads dstat=%.0f chcr=%.0f csr=%.0f | stubs syncpath=%.0f syncv=%.0f swap=%.0f putdisp=%.0f putdraw=%.0f dmasend=%.0f dmasync=%.0f\n",
+                                         rate(0), rate(1), rate(2), rate(8), rate(9), rate(10),
+                                         applied ? double(st[6] - lastStat[6]) / 1000.0 / double(applied) : 0.0, double(st[7]) / 1000.0,
+                                         rate(3), rate(4), rate(5), srate(0), srate(1), srate(2), srate(3), srate(4), srate(5), srate(6));
+                            s3gfx::stat[7].store(0);
+                            for (int k = 0; k < 16; ++k) lastStat[k] = st[k];
+                            for (int k = 0; k < 8; ++k) lastStub[k] = sb[k];
+                        }
+                        std::string gsWaits;
+                        for (uint32_t r = 0; r < 0x110u; ++r)
+                            if (const uint64_t n = s3gfx::gsRegWaits[r].load())
+                                gsWaits += " " + std::to_string(r << 4) + ":" + std::to_string(n);
+                        if (!gsWaits.empty())
+                            std::fprintf(stderr, "[gfx] waits by GS register offset:%s\n", gsWaits.c_str());
+                    }
+                    logVuCycles = vuCycles;
+                    logVuNative = vuNative;
+                    lastLogNs = now;
+                    logFrames = frames; logVsync = vsync; logVu = vu; logGs = gs; logGsVu = gsvu; logPresents = presents;
+                }
+            }
+            if (s3ff::active.load(std::memory_order_relaxed))
+            {
+                char ffText[48];
+                std::snprintf(ffText, sizeof(ffText), "FAST-FORWARD x%u", s3ff::speed());
+                const int fontSize = std::max(16, GetScreenHeight() / 40);
+                const int w = MeasureText(ffText, fontSize);
+                const int x = GetScreenWidth() - w - 18;
+                DrawRectangle(x - 6, 6, w + 12, fontSize + 8, Color{0, 0, 0, 170});
+                DrawText(ffText, x, 10, fontSize, Color{255, 210, 90, 255});
+            }
+            if (showFps && overlay[0])
+            {
+                const int fontSize = std::max(16, GetScreenHeight() / 40);
+                const int w = MeasureText(overlay, fontSize);
+                DrawRectangle(6, 6, w + 12, fontSize + 8, Color{0, 0, 0, 170});
+                DrawText(overlay, 12, 10, fontSize, Color{120, 255, 120, 255});
+            }
+        }
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);

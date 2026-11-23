@@ -122,6 +122,14 @@ namespace ps2_syscalls
                                   bool interruptSafe)
         {
             EeScheduler &ee = scheduler(rdram, ctx, runtime);
+            if (!interruptSafe)
+            {
+                // s3recomp: a yield is a syscall round trip on real hardware, and threads that
+                // spin on RotateThreadReadyQueue never let the scheduler go idle. Charge a
+                // realistic cost so guest time (and VBlank) keeps pace; host pacing still
+                // holds every event until its real deadline.
+                ee.accountCycles(4096u);
+            }
             const int result = ee.rotateReadyQueue(static_cast<int>(getRegU32(ctx, 4)), interruptSafe);
             setReturnS32(ctx, result);
             ee.transferIfRequested(interruptSafe);

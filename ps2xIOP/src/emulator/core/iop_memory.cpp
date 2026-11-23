@@ -33,6 +33,7 @@ namespace ps2x::iop::detail
         m_hardware.clear();
         m_allocations.clear();
         m_heapCursor = HeapBase;
+        m_moduleTop = ModuleBase;
         m_interruptStatus = 0;
         m_interruptMask = 0;
         m_interruptControl = 1;
@@ -289,7 +290,7 @@ namespace ps2x::iop::detail
         if (fixed)
         {
             const uint32_t address = *fixed;
-            if (address < HeapBase || address + size > HeapLimit)
+            if (address < m_moduleTop || address > HeapLimit || size > HeapLimit - address)
                 return 0u;
             for (const auto &block : m_allocations)
                 if (address < block.address + block.size && block.address < address + size)
@@ -299,15 +300,22 @@ namespace ps2x::iop::detail
             return address;
         }
 
-        uint32_t candidate = alignUp(m_heapCursor, alignment);
+        // Top-down first fit, never below the loaded modules.
+        if (size > HeapLimit - m_moduleTop)
+            return 0u;
+        uint32_t candidate = (HeapLimit - size) & ~(alignment - 1u);
         for (;;)
         {
+            if (candidate < m_moduleTop)
+                return 0u;
             bool overlap = false;
             for (const auto &block : m_allocations)
             {
                 if (candidate < block.address + block.size && block.address < candidate + size)
                 {
-                    candidate = alignUp(block.address + block.size, alignment);
+                    if (block.address < size)
+                        return 0u;
+                    candidate = (block.address - size) & ~(alignment - 1u);
                     overlap = true;
                     break;
                 }
@@ -315,12 +323,23 @@ namespace ps2x::iop::detail
             if (!overlap)
                 break;
         }
-        if (candidate > HeapLimit || size > HeapLimit - candidate)
-            return 0u;
         m_allocations.push_back({candidate, size});
         markOwned(candidate, size);
-        m_heapCursor = std::max(m_heapCursor, candidate + size);
+        m_heapCursor = std::min(m_heapCursor, candidate);
         return candidate;
+    }
+
+    uint32_t IopMemory::lowestAllocation() const
+    {
+        uint32_t lowest = HeapLimit;
+        for (const auto &block : m_allocations)
+            lowest = std::min(lowest, block.address);
+        return lowest;
+    }
+
+    void IopMemory::setModuleTop(uint32_t top)
+    {
+        m_moduleTop = std::max(m_moduleTop, std::min(top, HeapLimit));
     }
 
     bool IopMemory::freeAllocation(uint32_t address)
@@ -339,7 +358,22 @@ namespace ps2x::iop::detail
 
     uint32_t IopMemory::maxFreeMemory() const
     {
-        return m_heapCursor < HeapLimit ? HeapLimit - m_heapCursor : 0u;
+        // Largest contiguous free block between the modules and HeapLimit.
+        std::vector<Allocation> blocks = m_allocations;
+        std::sort(blocks.begin(), blocks.end(), [](const Allocation &a, const Allocation &b) { return a.address < b.address; });
+        uint32_t best = 0u;
+        uint32_t cursor = m_moduleTop;
+        for (const auto &block : blocks)
+        {
+            if (block.address + block.size <= cursor)
+                continue;
+            if (block.address > cursor)
+                best = std::max(best, block.address - cursor);
+            cursor = std::max(cursor, block.address + block.size);
+        }
+        if (HeapLimit > cursor)
+            best = std::max(best, HeapLimit - cursor);
+        return best;
     }
 
     std::optional<IopMemory::Allocation> IopMemory::allocationContaining(uint32_t address) const

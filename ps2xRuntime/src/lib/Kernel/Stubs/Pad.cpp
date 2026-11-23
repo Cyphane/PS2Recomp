@@ -245,7 +245,7 @@ namespace ps2_stubs
         void fillPadStatus(uint8_t *data, const PadInputState &state, const PadPortState &portState)
         {
             std::memset(data, 0, 32);
-            data[1] = portState.analogMode ? kPadModeDualShock : kPadModeDigital;
+            data[1] = !portState.analogMode ? kPadModeDigital : (portState.pressureEnabled ? 0x79u : kPadModeDualShock);
             data[2] = static_cast<uint8_t>(state.buttons & 0xFFu);
             data[3] = static_cast<uint8_t>((state.buttons >> 8) & 0xFFu);
             data[4] = state.rx;
@@ -527,16 +527,20 @@ namespace ps2_stubs
             setReturnS32(ctx, currentId);
             return;
         case 3: // PAD_MODECUROFFS
-            setReturnS32(ctx, 0);
+            setReturnS32(ctx, portState->analogMode ? 1 : 0);
             return;
-        case 4: // PAD_MODETABLE
+        case 4: // PAD_MODETABLE: a DualShock 2 offers digital (4) and DualShock (7)
             if (index == -1)
             {
-                setReturnS32(ctx, 1); // one available mode
+                setReturnS32(ctx, 2);
             }
             else if (index == 0)
             {
-                setReturnS32(ctx, currentId);
+                setReturnS32(ctx, kPadTypeDigital);
+            }
+            else if (index == 1)
+            {
+                setReturnS32(ctx, kPadTypeDualShock);
             }
             else
             {
@@ -664,7 +668,11 @@ namespace ps2_stubs
             }
         });
 
-        setReturnS32(ctx, 1);
+        // libpad returns the received data length, (mode & 0x0F) * 2 + 2 bytes: 4 for digital (0x41),
+        // 8 for DualShock (0x73), 20 with pressure (0x79). Games pad everything past it with 0xFF,
+        // so returning 1 erased the button bytes.
+        const int32_t length = 2 + static_cast<int32_t>(data[1] & 0x0Fu) * 2;
+        setReturnS32(ctx, length);
     }
 
     void scePadReqIntToStr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

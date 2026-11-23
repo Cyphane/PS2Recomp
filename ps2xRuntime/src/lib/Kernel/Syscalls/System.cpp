@@ -470,6 +470,12 @@ namespace ps2_syscalls
 
     // 0x3C SetupThread
     // args: $a0 = gp, $a1 = stack, $a2 = stack_size, $a3 = args, $t0 = root_func
+    static uint32_t &s3MainStackFloor()
+    {
+        static uint32_t floor = 0u;
+        return floor;
+    }
+
     void SetupThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t gp = getRegU32(ctx, 4);
@@ -531,6 +537,12 @@ namespace ps2_syscalls
         }
 
         scheduler.setupCurrentThread(initialStack, stackSize, getRegU32(ctx, 28));
+        // s3recomp: remember where the main stack begins so SetupHeap(-1) can hand the game
+        // all memory up to it, like the real kernel does.
+        if (stackSize != 0u && sp > stackSize)
+            s3MainStackFloor() = sp - stackSize;
+        else if (stack != 0u && stack != 0xFFFFFFFFu)
+            s3MainStackFloor() = stack;
         setReturnU32(ctx, sp);
     }
 
@@ -546,6 +558,10 @@ namespace ps2_syscalls
         static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
         uint32_t heapLimit = kDefaultGuestHeapEnd;
 
+        if (heapSize == 0xFFFFFFFFu && s3MainStackFloor() > heapBase && s3MainStackFloor() <= PS2_RAM_SIZE)
+        {
+            heapLimit = s3MainStackFloor();
+        }
         if (heapSize != 0u && heapSize != 0xFFFFFFFFu)
         {
             const uint64_t candidate = static_cast<uint64_t>(heapBase) + static_cast<uint64_t>(heapSize);

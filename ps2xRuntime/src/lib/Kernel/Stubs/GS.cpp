@@ -1,4 +1,6 @@
 #include "Common.h"
+namespace s3gfx { void externalSyncPoint(); void countStub(int id); }
+namespace s3gsq { void drain(); }
 #include "GS.h"
 #include "ps2_log.h"
 #include "runtime/gs/ps2_gs_common.h"
@@ -122,7 +124,8 @@ namespace ps2_stubs
             runtime->gs().writeRegister(static_cast<uint8_t>(clear.testb.reg & 0xFFu), clear.testb.value);
         }
 
-        void refreshPacketBuilderPendingCount(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr);
+        [[maybe_unused]] void refreshPacketBuilderPendingCount(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr);
+        void writeGuestU32(uint8_t *rdram, PS2Runtime *runtime, uint32_t addr, uint32_t value);
         void writePacketBuilderCurrent(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr, uint32_t currentAddr);
 
         void initPacketBuilderState(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -157,7 +160,19 @@ namespace ps2_stubs
                 currentAddr += 4u;
             }
 
-            writePacketBuilderCurrent(rdram, runtime, stateAddr, currentAddr);
+            writeGuestU32(rdram, runtime, stateAddr, currentAddr);
+            // Patch the open DMA tag's QWC the way libpkt's own terminate does (tag += qwc).
+            // Doing it only here keeps HLE helpers consistent with recompiled libpkt
+            // functions mixed into the same packet (s3recomp: Suikoden III movie upload).
+            uint32_t pendingTagAddr = 0u;
+            uint32_t tagWord = 0u;
+            if (tryReadWordFromGuest(rdram, runtime, stateAddr + 8u, pendingTagAddr) &&
+                pendingTagAddr != 0u && currentAddr > pendingTagAddr &&
+                tryReadWordFromGuest(rdram, runtime, pendingTagAddr, tagWord))
+            {
+                const uint32_t deltaQwords = ((currentAddr - pendingTagAddr) >> 4u) - 1u;
+                writeGuestU32(rdram, runtime, pendingTagAddr, tagWord + deltaQwords);
+            }
             writeGuestBytes(rdram,
                             runtime,
                             stateAddr + 8u,
@@ -258,8 +273,8 @@ namespace ps2_stubs
 
         void writePacketBuilderCurrent(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr, uint32_t currentAddr)
         {
+            // The pending DMA tag's QWC is patched once, at terminate (see terminatePacketBuilderState).
             writeGuestU32(rdram, runtime, stateAddr, currentAddr);
-            refreshPacketBuilderPendingCount(rdram, runtime, stateAddr);
         }
 
         uint32_t reservePacketBuilderWords(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr, uint32_t wordCount)
@@ -611,13 +626,26 @@ namespace ps2_stubs
 
         uint32_t fbw = img.vram_width ? img.vram_width : std::max<uint32_t>(1, (img.width + 63) / 64);
         const uint32_t totalImageBytes = rowBytes * static_cast<uint32_t>(img.height);
-        const uint32_t headerQwc = 6u;
+        // s3recomp: a GIF IMAGE tag carries at most 0x7FFF quadwords (NLOOP is 15 bits), so large
+        // images go out as several IMAGE tags, as the real library does. Masking a single tag's
+        // NLOOP dropped the end of any image over 512 KiB.
+        constexpr uint32_t kMaxImageTagQwc = 0x7FFFu;
+        const uint32_t regsQwc = 5u; // A+D tag and four registers
         const uint32_t imageQwc = (totalImageBytes + 15u) / 16u;
-        const uint32_t totalQwc = headerQwc + imageQwc;
+        const uint32_t imageTags = std::max<uint32_t>(1u, (imageQwc + kMaxImageTagQwc - 1u) / kMaxImageTagQwc);
+        const uint32_t totalQwc = regsQwc + imageTags + imageQwc;
+
+        static const bool traceImages = std::getenv("PS2X_TRACE_GSIMAGE") != nullptr;
+        if (traceImages)
+            std::fprintf(stderr, "[gsimage] load vram=%u psm=0x%x bw=%u x=%u y=%u w=%u h=%u bytes=%u src=0x%08x\n",
+                         static_cast<unsigned>(img.vram_addr), static_cast<unsigned>(img.psm), static_cast<unsigned>(img.vram_width),
+                         static_cast<unsigned>(img.x), static_cast<unsigned>(img.y), static_cast<unsigned>(img.width),
+                         static_cast<unsigned>(img.height), totalImageBytes, srcAddr);
 
         uint32_t pktAddr = runtime->guestMalloc(totalQwc * 16u, 16u);
         if (pktAddr == 0)
         {
+            std::fprintf(stderr, "[gsimage] load of %u bytes dropped: no guest memory for the GIF packet\n", totalImageBytes);
             setReturnS32(ctx, -1);
             return;
         }
@@ -631,7 +659,9 @@ namespace ps2_stubs
             return;
         }
 
-        uint32_t dbp = (static_cast<uint32_t>(img.vram_addr) * 2048u) / 256u;
+        // s3recomp: vram_addr is the block address (256-byte units) passed to sceGsSetDefLoadImage,
+        // the BITBLTBUF value itself; scaling it by 8 sent the transfer to the wrong place.
+        uint32_t dbp = static_cast<uint32_t>(img.vram_addr);
         uint32_t dsax = static_cast<uint32_t>(img.x);
         uint32_t dsay = static_cast<uint32_t>(img.y);
 
@@ -649,19 +679,42 @@ namespace ps2_stubs
         q[7] = 0x52ULL;
         q[8] = 0ULL;
         q[9] = 0x53ULL;
-        q[10] = (static_cast<uint64_t>(2) << 58) | (static_cast<uint64_t>(imageQwc) & 0x7FFF) |
-                (1ULL << 15);
-        q[11] = 0ULL;
 
-        std::memcpy(pkt + headerQwc * 16u, src, totalImageBytes);
+        uint8_t *cursor = pkt + regsQwc * 16u;
+        uint32_t copied = 0u;
+        for (uint32_t tag = 0u, left = imageQwc; tag < imageTags; ++tag)
+        {
+            const uint32_t chunkQwc = std::min(left, kMaxImageTagQwc);
+            left -= chunkQwc;
+            const uint64_t imageTag[2] = {(static_cast<uint64_t>(2) << 58) | static_cast<uint64_t>(chunkQwc) |
+                                              (tag + 1u == imageTags ? (1ULL << 15) : 0ULL),
+                                          0ULL};
+            std::memcpy(cursor, imageTag, 16u);
+            cursor += 16u;
+            const uint32_t chunkBytes = std::min(chunkQwc * 16u, totalImageBytes - copied);
+            std::memcpy(cursor, src + copied, chunkBytes);
+            if (chunkBytes < chunkQwc * 16u)
+                std::memset(cursor + chunkBytes, 0, chunkQwc * 16u - chunkBytes);
+            copied += chunkBytes;
+            cursor += chunkQwc * 16u;
+        }
 
         constexpr uint32_t GIF_CHANNEL = 0x1000A000;
         constexpr uint32_t CHCR_STR_MODE0 = 0x101u;
         auto &mem = runtime->memory();
-        mem.writeIORegister(GIF_CHANNEL + 0x10u, pktAddr);
-        mem.writeIORegister(GIF_CHANNEL + 0x20u, totalQwc & 0xFFFFu);
-        mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
-        mem.processPendingTransfers();
+        // One DMA transfer per IMAGE tag (QWC is 16 bits); the first also carries the registers.
+        uint32_t sendAddr = pktAddr;
+        for (uint32_t tag = 0u, left = imageQwc; tag < imageTags; ++tag)
+        {
+            const uint32_t chunkQwc = std::min(left, kMaxImageTagQwc);
+            left -= chunkQwc;
+            const uint32_t sendQwc = (tag == 0u ? regsQwc : 0u) + 1u + chunkQwc;
+            mem.writeIORegister(GIF_CHANNEL + 0x10u, sendAddr);
+            mem.writeIORegister(GIF_CHANNEL + 0x20u, sendQwc);
+            mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
+            mem.processPendingTransfers();
+            sendAddr += sendQwc * 16u;
+        }
         runtime->guestFree(pktAddr);
 
         setReturnS32(ctx, 0);
@@ -669,6 +722,7 @@ namespace ps2_stubs
 
     void sceGsExecStoreImage(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        s3gfx::externalSyncPoint();
         uint32_t imgAddr = getRegU32(ctx, 4);
         uint32_t dstAddr = getRegU32(ctx, 5);
 
@@ -696,7 +750,8 @@ namespace ps2_stubs
             return;
         }
 
-        uint32_t sbp = (static_cast<uint32_t>(img.vram_addr) * 2048u) / 256u;
+        // s3recomp: block address as passed to sceGsSetDefStoreImage (see sceGsExecLoadImage).
+        uint32_t sbp = static_cast<uint32_t>(img.vram_addr);
         uint64_t bitbltbuf = (static_cast<uint64_t>(sbp & 0x3FFFu) << 0) |
                              (static_cast<uint64_t>(fbw & 0x3Fu) << 16) |
                              (static_cast<uint64_t>(img.psm & 0x3Fu) << 24) |
@@ -745,7 +800,26 @@ namespace ps2_stubs
         mem.processPendingTransfers();
 
         ps2TraceGuestRangeWrite(rdram, dstAddr, totalImageBytes, "sceGsExecStoreImage", ctx);
-        runtime->gs().consumeLocalToHostBytes(dst, totalImageBytes);
+        s3gsq::drain(); // the download is produced by the GS thread
+        const uint32_t got = runtime->gs().consumeLocalToHostBytes(dst, totalImageBytes);
+        static const bool traceImages = std::getenv("PS2X_TRACE_GSIMAGE") != nullptr;
+        if (traceImages || got != totalImageBytes)
+            std::fprintf(stderr, "[gsimage] store vram=%u psm=0x%x bw=%u x=%u y=%u w=%u h=%u bytes=%u got=%u dst=0x%08x\n",
+                         static_cast<unsigned>(img.vram_addr), static_cast<unsigned>(img.psm), static_cast<unsigned>(img.vram_width),
+                         static_cast<unsigned>(img.x), static_cast<unsigned>(img.y), static_cast<unsigned>(img.width),
+                         static_cast<unsigned>(img.height), totalImageBytes, got, dstAddr);
+        if (const char *dumpDir = std::getenv("PS2X_DUMP_GSSTORE"))
+        {
+            static int dumpIndex = 0;
+            char path[512];
+            std::snprintf(path, sizeof(path), "%s/gsstore_%03d_%ux%u_psm%x.raw", dumpDir, dumpIndex++,
+                          static_cast<unsigned>(img.width), static_cast<unsigned>(img.height), static_cast<unsigned>(img.psm));
+            if (FILE *f = std::fopen(path, "wb"))
+            {
+                std::fwrite(dst, 1, totalImageBytes, f);
+                std::fclose(f);
+            }
+        }
         runtime->guestFree(pktAddr);
 
         setReturnS32(ctx, 0);
@@ -759,6 +833,8 @@ namespace ps2_stubs
 
     void sceGsPutDispEnv(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        s3gfx::countStub(3);
+        s3gfx::externalSyncPoint();
         uint32_t envAddr = getRegU32(ctx, 4);
         GsDispEnvMem env{};
         if (!readGsDispEnv(rdram, envAddr, env))
@@ -772,6 +848,8 @@ namespace ps2_stubs
 
     void sceGsPutDrawEnv(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        s3gfx::countStub(4);
+        s3gfx::externalSyncPoint();
         uint32_t envAddr = getRegU32(ctx, 4);
         GsRegPairMem pairs[8]{};
         if (!readGsRegPairs(rdram, envAddr, pairs, 8u))
@@ -785,6 +863,7 @@ namespace ps2_stubs
 
     void sceGsResetGraph(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        s3gfx::externalSyncPoint();
         uint32_t mode = getRegU32(ctx, 4);
         uint32_t interlace = getRegU32(ctx, 5);
         uint32_t omode = getRegU32(ctx, 6);
@@ -798,10 +877,11 @@ namespace ps2_stubs
                 return;
             }
 
+            // s3recomp: libgraph keeps these in its own data; the real sceGsResetGraph does not
+            // touch the scratchpad (the game owns it), so only the host copy is updated here.
             g_gparam.interlace = static_cast<uint8_t>(interlace & 0x1);
             g_gparam.omode = static_cast<uint8_t>(omode & 0xFF);
             g_gparam.ffmode = static_cast<uint8_t>(ffmode & 0x1);
-            writeGsGParamToScratch(runtime);
             uint64_t pmode = makePmode(1, 0, 0, 0, 0, 0x80);
             uint64_t smode2 = (interlace & 0x1) | ((ffmode & 0x1) << 1);
             uint64_t dispfb = makeDispFb(0, 10, 0, 0, 0);
@@ -855,6 +935,7 @@ namespace ps2_stubs
 
     void sceGsResetPath(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        s3gfx::externalSyncPoint();
         setReturnS32(ctx, 0);
     }
 
@@ -903,9 +984,13 @@ namespace ps2_stubs
             zbufAddr = getRegU32(&temp, 2);
         }
 
-        const uint32_t fbp1 = zbufAddr;
-        const uint64_t dispfb0 = makeDispFb(fbp1, fbw, psm, 0u, 0u);
-        const uint64_t dispfb1 = makeDispFb(0u, fbw, psm, 0u, 0u);
+        // libgraph places the second buffer at zbuf/2 (right after the first) and only when
+        // double buffering: non-interlaced, or interlaced FRAME mode. In FIELD mode both
+        // buffers stay at page 0. disp[1] and draw0x get it; disp[0] and draw1x keep page 0.
+        const bool doubleBuffered = g_gparam.interlace == 0 || (g_gparam.interlace == 1 && g_gparam.ffmode == 1);
+        const uint32_t fbp1 = doubleBuffered ? ((zbufAddr >> 1) & 0x1FFu) : 0u;
+        const uint64_t dispfb0 = makeDispFb(0u, fbw, psm, 0u, 0u);
+        const uint64_t dispfb1 = makeDispFb(fbp1, fbw, psm, 0u, 0u);
 
         GsDBuffDcMem db{};
         db.disp[0].pmode = pmode;
@@ -918,11 +1003,11 @@ namespace ps2_stubs
 
         const bool seedClear = clear != 0u;
         db.giftag0 = {makeGiftagAplusD(seedClear ? 22u : 16u), 0xEULL};
-        seedGsDrawEnv1(db.draw01, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
-        seedGsDrawEnv2(db.draw02, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
+        seedGsDrawEnv1(db.draw01, drawWidth, drawHeight, fbp1, fbw, psm, zbufAddr, zpsm, ztest, false);
+        seedGsDrawEnv2(db.draw02, drawWidth, drawHeight, fbp1, fbw, psm, zbufAddr, zpsm, ztest, false);
         db.giftag1 = db.giftag0;
-        seedGsDrawEnv1(db.draw11, drawWidth, drawHeight, fbp1, fbw, psm, zbufAddr, zpsm, ztest, false);
-        seedGsDrawEnv2(db.draw12, drawWidth, drawHeight, fbp1, fbw, psm, zbufAddr, zpsm, ztest, false);
+        seedGsDrawEnv1(db.draw11, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
+        seedGsDrawEnv2(db.draw12, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
         if (seedClear)
         {
             seedGsClearPacket(db.clear0, drawWidth, drawHeight, 0u, ztest, false);
@@ -1130,6 +1215,8 @@ namespace ps2_stubs
 
     void sceGsSwapDBuffDc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        s3gfx::countStub(2);
+        s3gfx::externalSyncPoint();
         const uint32_t envAddr = getRegU32(ctx, 4);
         const uint32_t which = getRegU32(ctx, 5) & 1u;
 
@@ -1213,6 +1300,7 @@ namespace ps2_stubs
 
     void sceGsSyncPath(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        s3gfx::countStub(0);
         int32_t mode = static_cast<int32_t>(getRegU32(ctx, 4));
         auto &mem = runtime->memory();
 
@@ -1280,6 +1368,7 @@ namespace ps2_stubs
 
     void sceGsSyncV(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        s3gfx::countStub(1);
         ps2_syscalls::WaitVSyncTick(rdram,
                                     ctx,
                                     runtime,
@@ -1345,16 +1434,12 @@ namespace ps2_stubs
 
         int32_t product = width_blocks * height_blocks;
 
-        uint64_t gparam_val = 0;
-        if (runtime)
-        {
-            uint8_t *scratch = runtime->memory().getScratchpad();
-            if (scratch)
-            {
-                std::memcpy(&gparam_val, scratch + 0x100, sizeof(gparam_val));
-            }
-        }
-        if ((gparam_val & 0xFFFF0000FFFFULL) == 1ULL)
+        // libgraph: interlaced FIELD mode uses one frame buffer, so the Z buffer follows it;
+        // every other mode is double buffered and the Z buffer follows the second one.
+        // (s3recomp: this used to read a byte-packed copy from the scratchpad, never matched the
+        // FIELD test and put Z one buffer too high, which shrank the game's texture pool.)
+        const bool fieldMode = g_gparam.interlace == 1 && g_gparam.ffmode == 0;
+        if (fieldMode)
             product = (product * 0x10000) >> 16;
         else
             product = (product * 0x20000) >> 16;

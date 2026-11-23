@@ -40,6 +40,7 @@ namespace ps2x::iop::detail
         [[nodiscard]] uint64_t instructions() const noexcept;
         [[nodiscard]] uint32_t loadedModuleCount() const noexcept;
         [[nodiscard]] uint32_t threadCount() const noexcept;
+        void appendThreadDebug(std::vector<std::string> &out) const; // s3recomp
         [[nodiscard]] uint32_t rpcServerCount() const noexcept;
 
     private:

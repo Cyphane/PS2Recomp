@@ -22,7 +22,12 @@ namespace ps2x::iop::detail
         static constexpr uint32_t Spu2End = 0x1FA00000u;
         static constexpr uint32_t SifBase = 0x1D000000u;
         static constexpr uint32_t SifEnd = 0x1D001000u;
-        static constexpr uint32_t HeapBase = 0x00120000u;
+        // s3recomp: IOP RAM between ModuleBase and HeapLimit is shared, as on real hardware.
+        // IRX modules are placed bottom-up from ModuleBase; kernel heap allocations are made
+        // top-down from HeapLimit. The split point is wherever the two meet, so one large
+        // module (e.g. a sound driver with a 1 MB BSS) can use space the heap isn't using.
+        static constexpr uint32_t ModuleBase = 0x00010000u;
+        static constexpr uint32_t HeapBase = 0x00120000u; // legacy: no longer a hard boundary
         static constexpr uint32_t HeapLimit = 0x001F0000u;
 
         struct Allocation
@@ -58,6 +63,11 @@ namespace ps2x::iop::detail
         [[nodiscard]] uint32_t allocate(uint32_t size, uint32_t alignment = 16u, std::optional<uint32_t> fixed = std::nullopt);
         [[nodiscard]] bool freeAllocation(uint32_t address);
         [[nodiscard]] uint32_t maxFreeMemory() const;
+        // Lowest address of any heap allocation (HeapLimit if none): the ceiling for module placement.
+        [[nodiscard]] uint32_t lowestAllocation() const;
+        // Highest address used by loaded modules: the floor for heap allocations.
+        void setModuleTop(uint32_t top);
+        [[nodiscard]] uint32_t moduleTop() const noexcept { return m_moduleTop; }
         [[nodiscard]] std::optional<Allocation> allocationContaining(uint32_t address) const;
 
         [[nodiscard]] uint32_t interruptStatus() const noexcept { return m_interruptStatus; }
@@ -83,6 +93,7 @@ namespace ps2x::iop::detail
         std::unordered_map<uint32_t, uint32_t> m_hardware;
         std::vector<Allocation> m_allocations;
         uint32_t m_heapCursor = HeapBase;
+        uint32_t m_moduleTop = ModuleBase;
         uint32_t m_interruptStatus = 0;
         uint32_t m_interruptMask = 0;
         uint32_t m_interruptControl = 1;

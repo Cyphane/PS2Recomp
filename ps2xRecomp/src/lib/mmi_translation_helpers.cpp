@@ -145,7 +145,8 @@ namespace ps2recomp
         case MMI2_PMFLO:
             return fmt::format("SET_GPR_U64(ctx, {}, ctx->lo);", rd);
         case MMI2_PINTH:
-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PINTH(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
+            // s3recomp: PINTH interleaves rt's lower halfwords with rs's upper halfwords.
+            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_unpacklo_epi16(GPR_VEC(ctx, {}), _mm_unpackhi_epi64(GPR_VEC(ctx, {}), GPR_VEC(ctx, {}))));", rd, rt, rs, rs);
         case MMI2_PMULTW:
             return translatePMULTW(inst);
         case MMI2_PDIVW:
@@ -199,7 +200,8 @@ namespace ps2recomp
         case MMI3_PMTLO:
             return translatePMTLO(inst);
         case MMI3_PINTEH:
-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PINTEH(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
+            // s3recomp: PINTEH interleaves the even halfwords of rt (low) and rs (high).
+            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_or_si128(_mm_and_si128(GPR_VEC(ctx, {}), _mm_set1_epi32(0xFFFF)), _mm_slli_epi32(GPR_VEC(ctx, {}), 16)));", rd, rt, rs);
         case MMI3_PMULTUW:
             return translatePMULTUW(inst);
         case MMI3_PDIVUW:
@@ -454,8 +456,8 @@ namespace ps2recomp
 
     std::string CodeGenerator::translatePEXEH(const Instruction &inst)
     {
-        // Swaps halfwords 1<->3 and 5<->7 within the 128-bit register
-        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shufflelo_epi16(_mm_shufflehi_epi16(GPR_VEC(ctx, {}), _MM_SHUFFLE(2,3,0,1)), _MM_SHUFFLE(2,3,0,1)));",
+        // s3recomp: exchanges even halfwords (h0<->h2, h4<->h6).
+        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shufflelo_epi16(_mm_shufflehi_epi16(GPR_VEC(ctx, {}), _MM_SHUFFLE(3,0,1,2)), _MM_SHUFFLE(3,0,1,2)));",
                            inst.rd, inst.rt);
     }
 
@@ -463,8 +465,8 @@ namespace ps2recomp
     std::string CodeGenerator::translatePREVH(const Instruction &inst)
     {
         // Reverses the order of the 8 halfwords
-        return fmt::format("{{ __m128i mask = _mm_setr_epi8(14,15, 12,13, 10,11, 8,9, 6,7, 4,5, 2,3, 0,1); "
-                           "SET_GPR_VEC(ctx, {}, PS2_SHUFFLE_EPI8(GPR_VEC(ctx, {}), mask)); }}",
+        // s3recomp: PREVH reverses the halfwords within each doubleword, not across the register.
+        return fmt::format("{{ SET_GPR_VEC(ctx, {}, _mm_shufflelo_epi16(_mm_shufflehi_epi16(GPR_VEC(ctx, {}), _MM_SHUFFLE(0,1,2,3)), _MM_SHUFFLE(0,1,2,3))); }}",
                            inst.rd, inst.rt);
     }
 
@@ -513,7 +515,8 @@ namespace ps2recomp
 
     std::string CodeGenerator::translatePEXEW(const Instruction &inst)
     {
-        return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PEXEW(GPR_VEC(ctx, {})));",
+        // s3recomp: exchanges even words (w0<->w2).
+        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(3,0,1,2)));",
                            inst.rd, inst.rt);
     }
 
@@ -521,7 +524,8 @@ namespace ps2recomp
     std::string CodeGenerator::translatePROT3W(const Instruction &inst)
     {
         // Rotates words left by 3: [d,c,b,a] -> [a,d,c,b]
-        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(0,3,2,1)));",
+        // s3recomp: rotates the low three words only; w3 is kept.
+        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(3,0,2,1)));",
                            inst.rd, inst.rt);
     }
 
@@ -561,7 +565,8 @@ namespace ps2recomp
     std::string CodeGenerator::translatePEXCH(const Instruction &inst)
     {
         // Parallel Exchange Center Halfword (same as MMI2 PEXEH)
-        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shufflelo_epi16(_mm_shufflehi_epi16(GPR_VEC(ctx, {}), _MM_SHUFFLE(2,3,0,1)), _MM_SHUFFLE(2,3,0,1)));",
+        // s3recomp: exchanges the centre halfwords (h1<->h2, h5<->h6).
+        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shufflelo_epi16(_mm_shufflehi_epi16(GPR_VEC(ctx, {}), _MM_SHUFFLE(3,1,2,0)), _MM_SHUFFLE(3,1,2,0)));",
                            inst.rd, inst.rt);
     }
 
@@ -578,7 +583,8 @@ namespace ps2recomp
     std::string CodeGenerator::translatePEXCW(const Instruction &inst)
     {
         // Parallel Exchange Center Word (Swaps words 0<>2, 1<>3)
-        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(1,0,3,2)));",
+        // s3recomp: exchanges the centre words (w1<->w2).
+        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(3,1,2,0)));",
                            inst.rd, inst.rt);
     }
 

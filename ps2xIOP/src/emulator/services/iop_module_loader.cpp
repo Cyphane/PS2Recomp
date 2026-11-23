@@ -431,18 +431,22 @@ namespace ps2x::iop::detail
         int64_t delta = 0;
         if (relocate)
         {
-            base = alignUp(moduleCursor, 0x100u);
-            if (base + span >= IopMemory::HeapBase)
+            base = alignUp(std::max(moduleCursor, memory.moduleTop()), 0x100u);
+            // Modules may grow up to the lowest heap allocation (heap grows down from HeapLimit).
+            if (base + span > memory.lowestAllocation())
             {
                 result.error = IopImageLoadError::ArenaExhausted;
                 return result;
             }
             delta = static_cast<int64_t>(base) - minVaddr;
             result.nextModuleCursor = base + span;
+            memory.setModuleTop(base + span);
         }
         else
         {
             base = minVaddr;
+            if (maxVaddr <= IopMemory::HeapLimit)
+                memory.setModuleTop(maxVaddr);
         }
 
         if (hasLoad)

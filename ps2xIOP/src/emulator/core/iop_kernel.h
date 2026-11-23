@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <string>
+#include <vector>
 
 namespace ps2x::iop::detail
 {
@@ -61,12 +63,13 @@ namespace ps2x::iop::detail
         void delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu);
 
         [[nodiscard]] IopThread *beginNextReady(uint64_t currentCycle);
-        [[nodiscard]] uint64_t nextWakeCycle(uint64_t fallback) const;
+        [[nodiscard]] uint64_t nextWakeCycle(uint64_t fallback);
         void endTimeslice(IopThread &thread, uint32_t returnSentinel);
         void cleanupDeadThreads();
         void terminateThreadsInRange(uint32_t base, uint32_t size);
 
         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
+        void appendDebug(std::vector<std::string> &out) const; // s3recomp
 
     private:
         struct Semaphore
@@ -93,6 +96,12 @@ namespace ps2x::iop::detail
 
         IopMemory &m_memory;
         std::map<int, IopThread> m_threads;
+        // s3recomp: flat view of m_threads for the scheduler (map nodes are stable), rebuilt when
+        // threads are added or removed; m_deadPending says a cleanup pass is needed.
+        std::vector<IopThread *> m_threadList;
+        bool m_threadListDirty = true;
+        bool m_deadPending = false;
+        std::vector<IopThread *> &threadList();
         std::map<int, Semaphore> m_semaphores;
         std::map<int, EventFlag> m_eventFlags;
         uint32_t m_nextThreadId = 1;

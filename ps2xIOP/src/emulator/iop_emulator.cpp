@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <cstdio>
 #include "iop_emulator.h"
 #include "imports/iop_cdvd.h"
 #include "core/iop_cpu.h"
@@ -105,7 +107,7 @@ namespace ps2x::iop::detail
               heaplib(memory),
               intrman(memory),
               timrman(),
-              ioman(memory),
+              ioman(hostRef, memory),
               cpuCore(memory),
               imports(memory),
               loadcore(memory, imports)
@@ -123,6 +125,7 @@ namespace ps2x::iop::detail
             cdvd.reset();
             intrman.reset();
             timrman.reset();
+            vblank.reset();
             ioman.reset();
             pendingDmaInterrupts.clear();
             pendingGuestCallbacks.clear();
@@ -563,6 +566,7 @@ namespace ps2x::iop::detail
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
                     timrman.serviceDue(totalCycles, *this);
+                    vblank.serviceDue(totalCycles, *this);
                     IopThread *next = kernel.beginNextReady(totalCycles);
                     if (!next)
                     {
@@ -572,6 +576,7 @@ namespace ps2x::iop::detail
                         if (!pendingGuestCallbacks.empty())
                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
                         nextWake = timrman.nextEventCycle(nextWake);
+                        nextWake = vblank.nextEventCycle(nextWake);
                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
                         continue;
                     }
@@ -614,19 +619,47 @@ namespace ps2x::iop::detail
             module.entry = loaded.entry;
             module.gp = loaded.gp;
 
-            uint32_t args = 0u;
+            // s3recomp: modules are started as start(argc, argv) like the real IOP loadcore does.
+            // argv[0] is the module path and argv[1..] are the NUL-separated strings passed by
+            // SifLoadModule. (Passing the raw buffer as argv made modules such as SD_CALL read
+            // garbage for argv[1] and fall back to debug host0: paths.) The block stays allocated
+            // because modules may keep the argv pointers.
+            std::vector<std::string> argvStrings;
+            argvStrings.push_back(module.path);
             if (arguments && argumentSize)
             {
-                args = allocate(argumentSize + 1u, 16u);
-                if (args)
+                const char *raw = static_cast<const char *>(arguments);
+                uint32_t pos = 0u;
+                while (pos < argumentSize)
                 {
-                    writeRam(args, arguments, argumentSize);
-                    write8(args + argumentSize, 0u);
+                    uint32_t end = pos;
+                    while (end < argumentSize && raw[end] != '\0')
+                        ++end;
+                    argvStrings.emplace_back(raw + pos, raw + end);
+                    pos = end + 1u;
                 }
             }
-            const uint32_t startResult = callFunction(module.entry, argumentSize, args, 0u, 0u, module.gp);
-            if (args)
-                freeAllocation(args);
+            const uint32_t argc = static_cast<uint32_t>(argvStrings.size());
+            uint32_t stringBytes = 0u;
+            for (const auto &str : argvStrings)
+                stringBytes += static_cast<uint32_t>(str.size()) + 1u;
+            const uint32_t pointerBytes = (argc + 1u) * 4u;
+            const uint32_t argvBlock = allocate(pointerBytes + stringBytes, 16u);
+            if (argvBlock)
+            {
+                uint32_t cursor = argvBlock + pointerBytes;
+                for (uint32_t i = 0; i < argc; ++i)
+                {
+                    const auto &str = argvStrings[i];
+                    write32(argvBlock + i * 4u, cursor);
+                    if (!str.empty())
+                        writeRam(cursor, str.data(), static_cast<uint32_t>(str.size()));
+                    write8(cursor + static_cast<uint32_t>(str.size()), 0u);
+                    cursor += static_cast<uint32_t>(str.size()) + 1u;
+                }
+                write32(argvBlock + argc * 4u, 0u);
+            }
+            const uint32_t startResult = callFunction(module.entry, argvBlock ? argc : 0u, argvBlock, 0u, 0u, module.gp);
             module.resident = startResult == 0u || startResult == 2u;
             result.moduleId = module.id;
             result.startResult = static_cast<int32_t>(startResult);
@@ -636,7 +669,10 @@ namespace ps2x::iop::detail
             out << "[IOP] loaded IRX id=" << result.moduleId
                 << " entry=0x" << std::hex << modules[result.moduleId].entry
                 << " base=0x" << modules[result.moduleId].base
-                << " start=" << std::dec << result.startResult;
+                << " start=" << std::dec << result.startResult
+                << " argc=" << argc;
+            for (uint32_t i = 1; i < argc; ++i)
+                out << " arg" << i << "=\"" << argvStrings[i] << "\"";
             log(LogLevel::Info, out.str());
             return result;
         }
@@ -820,6 +856,36 @@ namespace ps2x::iop::detail
     uint32_t IopEmulator::threadCount() const noexcept
     {
         return static_cast<uint32_t>(m_impl->kernel.threadCount());
+    }
+
+    void IopEmulator::appendThreadDebug(std::vector<std::string> &out) const
+    {
+        char line[200];
+        std::snprintf(line, sizeof(line), "[iop] cycles=%llu instructions=%llu",
+                      static_cast<unsigned long long>(m_impl->totalCycles), static_cast<unsigned long long>(m_impl->totalInstructions));
+        out.emplace_back(line);
+        for (const auto &[id, module] : m_impl->modules)
+        {
+            std::snprintf(line, sizeof(line), "[iop-module] id=%d base=0x%x size=0x%x %s", id, module.base, module.size, module.name.c_str());
+            out.emplace_back(line);
+        }
+        m_impl->kernel.appendDebug(out);
+        m_impl->timrman.appendDebug(out);
+        if (const char *watch = std::getenv("PS2X_IOP_WATCH"))
+        {
+            std::string list(watch);
+            size_t pos = 0;
+            while (pos < list.size())
+            {
+                size_t end = list.find(',', pos);
+                if (end == std::string::npos)
+                    end = list.size();
+                const uint32_t addr = static_cast<uint32_t>(std::strtoul(list.substr(pos, end - pos).c_str(), nullptr, 16)) & ~3u;
+                std::snprintf(line, sizeof(line), "[iop-watch] 0x%08x = 0x%08x", addr, m_impl->memory.read32(addr));
+                out.emplace_back(line);
+                pos = end + 1;
+            }
+        }
     }
 
     uint32_t IopEmulator::rpcServerCount() const noexcept

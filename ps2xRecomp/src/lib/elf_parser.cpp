@@ -1649,9 +1649,26 @@ namespace
             }
         }
 
+        std::unordered_set<uint32_t> jalTargets(starts.begin(), starts.end());
         ScanMaterializedCodeAddresses(sections, starts);
         ScanDataFunctionPointerTables(sections, starts);
         ScanAdjacentLeafThunkRuns(sections, starts);
+
+        // A pointer-derived start that falls in a branch/jump delay slot is never a real entry: it
+        // usually comes from a data word that happens to equal that address. Splitting there cuts
+        // the owner off right after its call, and the call's return address then belongs to no
+        // function (a thread resuming there has nowhere to go). Direct JAL targets are kept.
+        for (auto it = starts.begin(); it != starts.end();)
+        {
+            const uint32_t start = *it;
+            const ps2recomp::Section *sec = FindCodeSectionByAddress(sections, start);
+            uint32_t prev = 0;
+            if (start != entry && !jalTargets.count(start) && sec && start - sec->address >= MIPS_INSTRUCTION_SIZE &&
+                ReadSectionWord(*sec, start - sec->address - MIPS_INSTRUCTION_SIZE, prev) && IsControlTransfer(prev))
+                it = starts.erase(it);
+            else
+                ++it;
+        }
 
         std::vector<uint32_t> sortedStarts(starts.begin(), starts.end());
         std::sort(sortedStarts.begin(), sortedStarts.end());

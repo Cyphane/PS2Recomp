@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "iop_kernel.h"
 
 #include "iop_memory.h"
@@ -23,9 +24,23 @@ namespace ps2x::iop::detail
     {
     }
 
+    std::vector<IopThread *> &IopKernel::threadList()
+    {
+        if (m_threadListDirty)
+        {
+            m_threadList.clear();
+            for (auto &[id, thread] : m_threads)
+                m_threadList.push_back(&thread);
+            m_threadListDirty = false;
+        }
+        return m_threadList;
+    }
+
     void IopKernel::reset()
     {
         m_threads.clear();
+        m_threadListDirty = true;
+        m_deadPending = false;
         m_semaphores.clear();
         m_eventFlags.clear();
         m_nextThreadId = 1;
@@ -62,6 +77,7 @@ namespace ps2x::iop::detail
             }
             const int id = thread.id;
             m_threads.emplace(id, std::move(thread));
+            m_threadListDirty = true;
             setV0(id);
             return true;
         }
@@ -77,6 +93,7 @@ namespace ps2x::iop::detail
             if (it->second.stackBase != 0u)
                 (void)m_memory.freeAllocation(it->second.stackBase);
             m_threads.erase(it);
+            m_threadListDirty = true;
             setV0(0);
             return true;
         }
@@ -107,6 +124,7 @@ namespace ps2x::iop::detail
             if (m_currentThread != nullptr)
             {
                 m_currentThread->state = ordinal == 9 ? IopThreadState::Dead : IopThreadState::Dormant;
+                m_deadPending = m_deadPending || ordinal == 9;
                 cpu.stopped = true;
                 cpu.yielded = true;
             }
@@ -671,20 +689,18 @@ namespace ps2x::iop::detail
 
     IopThread *IopKernel::beginNextReady(uint64_t currentCycle)
     {
-        for (auto &[id, thread] : m_threads)
-        {
-            if (thread.state == IopThreadState::Delay && thread.wakeCycle <= currentCycle)
-                thread.state = IopThreadState::Ready;
-        }
-
+        // One pass: wake due delayed threads and pick the highest-priority ready thread (lowest
+        // priority value, then lowest id), as the two separate passes did.
         IopThread *next = nullptr;
-        for (auto &[id, thread] : m_threads)
+        for (IopThread *thread : threadList())
         {
-            if (thread.state != IopThreadState::Ready)
+            if (thread->state == IopThreadState::Delay && thread->wakeCycle <= currentCycle)
+                thread->state = IopThreadState::Ready;
+            if (thread->state != IopThreadState::Ready)
                 continue;
-            if (next == nullptr || thread.priority < next->priority ||
-                (thread.priority == next->priority && thread.id < next->id))
-                next = &thread;
+            if (next == nullptr || thread->priority < next->priority ||
+                (thread->priority == next->priority && thread->id < next->id))
+                next = thread;
         }
         if (next == nullptr)
             return nullptr;
@@ -696,13 +712,13 @@ namespace ps2x::iop::detail
         return next;
     }
 
-    uint64_t IopKernel::nextWakeCycle(uint64_t fallback) const
+    uint64_t IopKernel::nextWakeCycle(uint64_t fallback)
     {
         uint64_t nextWake = fallback;
-        for (const auto &[id, thread] : m_threads)
+        for (const IopThread *thread : threadList())
         {
-            if (thread.state == IopThreadState::Delay)
-                nextWake = std::min(nextWake, thread.wakeCycle);
+            if (thread->state == IopThreadState::Delay)
+                nextWake = std::min(nextWake, thread->wakeCycle);
         }
         return nextWake;
     }
@@ -719,6 +735,10 @@ namespace ps2x::iop::detail
 
     void IopKernel::cleanupDeadThreads()
     {
+        if (!m_deadPending)
+            return;
+        m_deadPending = false;
+        m_threadListDirty = true;
         for (auto thread = m_threads.begin(); thread != m_threads.end();)
         {
             if (thread->second.state != IopThreadState::Dead)
@@ -739,6 +759,35 @@ namespace ps2x::iop::detail
             const uint32_t pc = IopMemory::physicalAddress(thread.cpu.pc);
             if (pc >= base && pc < base + size)
                 thread.state = IopThreadState::Dead;
+                m_deadPending = true;
+        }
+    }
+}
+
+namespace ps2x::iop::detail
+{
+    // s3recomp: one line per IOP thread and semaphore, for the periodic thread dump.
+    void IopKernel::appendDebug(std::vector<std::string> &out) const
+    {
+        static const char *const kStates[] = {"dormant", "ready", "running", "sleep", "delay", "sema", "evflag", "suspended", "dead"};
+        char line[256];
+        for (const auto &[id, t] : m_threads)
+        {
+            const unsigned st = static_cast<unsigned>(t.state);
+            std::snprintf(line, sizeof(line), "[iop-thread] id=%d %s wait=%d bits=0x%x pc=0x%x ra=0x%x sp=0x%x entry=0x%x pri=%u wake=%llu wakeups=%d",
+                          id, st < 9 ? kStates[st] : "?", t.waitId, t.waitBits, t.cpu.pc, t.cpu.gpr[31], t.cpu.gpr[29], t.entry,
+                          t.priority, static_cast<unsigned long long>(t.wakeCycle), t.wakeupCount);
+            out.emplace_back(line);
+        }
+        for (const auto &[id, sem] : m_semaphores)
+        {
+            std::snprintf(line, sizeof(line), "[iop-sema] id=%d count=%d max=%d", id, sem.current, sem.maximum);
+            out.emplace_back(line);
+        }
+        for (const auto &[id, ev] : m_eventFlags)
+        {
+            std::snprintf(line, sizeof(line), "[iop-evf] id=%d bits=0x%x", id, ev.bits);
+            out.emplace_back(line);
         }
     }
 }

@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "iop_timrman.h"
 
 #include "../core/iop_cpu.h"
@@ -436,6 +437,7 @@ namespace ps2x::iop::detail
                 continue;
 
             const Callback callback = compareDue ? timer.compareCallback : timer.overflowCallback;
+            ++timer.s3Fired;
             timer.compareCycle = UINT64_MAX;
             timer.overflowCycle = UINT64_MAX;
             const uint32_t result = callback.function != 0u
@@ -472,5 +474,23 @@ namespace ps2x::iop::detail
             next = std::min(next, timer.overflowCycle);
         }
         return next;
+    }
+}
+
+namespace ps2x::iop::detail
+{
+    void IopTimrman::appendDebug(std::vector<std::string> &out) const
+    {
+        char line[200];
+        for (size_t i = 0; i < m_timers.size(); ++i)
+        {
+            const Timer &t = m_timers[i];
+            if (!t.users)
+                continue;
+            std::snprintf(line, sizeof(line), "[iop-timer] #%zu running=%d src=%u pre=%u cmp=0x%x handler=0x%x next=%llu fired=%llu",
+                          i, t.running ? 1 : 0, t.source, t.prescale, t.compare, t.compareCallback.function,
+                          static_cast<unsigned long long>(t.compareCycle), static_cast<unsigned long long>(t.s3Fired));
+            out.emplace_back(line);
+        }
     }
 }

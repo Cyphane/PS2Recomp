@@ -34,7 +34,9 @@ function(EnableFastReleaseMode TargetName)
         endif()
     endif()
 
-    if(IPO_SUPPORTED)
+    # s3recomp: PS2X_DISABLE_IPO=ON keeps prebuilt runtime libraries free of LTO bitcode, so
+    # games can be linked against them quickly without whole-program optimisation.
+    if(IPO_SUPPORTED AND NOT PS2X_DISABLE_IPO)
         set_property(TARGET ${TargetName} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
     else()
         message(WARNING "Interprocedural optimization not supported: ${ipo_error}")

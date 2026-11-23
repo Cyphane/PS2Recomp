@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "Common.h"
 #include "Interrupt.h"
 
@@ -117,6 +118,7 @@ namespace ps2_syscalls
 
     void AddIntcHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        std::fprintf(stderr, "[irq] AddIntcHandler cause=%u handler=0x%x\n", getRegU32(ctx, 4), getRegU32(ctx, 5));
         addHandler(rdram, ctx, runtime, false);
     }
 
@@ -132,6 +134,7 @@ namespace ps2_syscalls
 
     void AddDmacHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        std::fprintf(stderr, "[irq] AddDmacHandler cause=%u handler=0x%x\n", getRegU32(ctx, 4), getRegU32(ctx, 5));
         addHandler(rdram, ctx, runtime, true);
     }
 

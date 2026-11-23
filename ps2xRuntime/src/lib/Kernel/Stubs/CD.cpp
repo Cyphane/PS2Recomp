@@ -204,6 +204,55 @@ namespace ps2_stubs
         return snapshot;
     }
 
+    // s3recomp: libcdvd calls the EE callback registered with sceCdCallback when a
+    // non-blocking ("N") command completes, passing the command's function code. This
+    // runtime completes commands synchronously, so the callback is queued right away and
+    // runs at the next scheduler checkpoint, in interrupt context like on hardware.
+    namespace
+    {
+        enum : uint32_t
+        {
+            kCdFuncRead = 1,
+            kCdFuncGetToc = 3,
+            kCdFuncSeek = 4,
+            kCdFuncStandby = 5,
+            kCdFuncStop = 6,
+            kCdFuncPause = 7,
+        };
+
+        // A successfully completed command clears the drive error (sceCdGetError reports the
+        // last command's result on hardware, not a sticky failure from earlier operations),
+        // then signals completion through the registered callback.
+        // Modelled drive latency. Commands complete synchronously here, but the callback is
+        // delivered later so the requesting thread blocks on its semaphore as on hardware;
+        // otherwise a high-priority CD thread never yields and starves the rest of the game.
+        uint64_t cdLatencyMicroseconds(uint32_t function, uint32_t sectors)
+        {
+            constexpr uint64_t kCommandUs = 2000u;     // stop/pause/standby/seek/TOC
+            constexpr uint64_t kBytesPerSecond = 5280000u; // ~4x DVD
+            if (function == kCdFuncRead)
+                return 500u + (static_cast<uint64_t>(sectors) * 2048u * 1000000u) / kBytesPerSecond;
+            return kCommandUs;
+        }
+
+        void queueCdCallback(PS2Runtime *runtime, uint32_t function, uint32_t sectors = 0u)
+        {
+            g_lastCdError = 0; // SCECdErNO
+            const uint32_t callback = g_cdCallback;
+            if (!runtime || callback == 0u || !runtime->hasFunction(callback))
+                return;
+            GuestInvocation invocation{};
+            invocation.kind = GuestInvocationKind::Interrupt;
+            invocation.context.pc = callback;
+            SET_GPR_U32(&invocation.context, 4, function);
+            SET_GPR_U32(&invocation.context, 28, g_cdCallbackGp);
+            SET_GPR_U32(&invocation.context, 29, 0u);
+            SET_GPR_U32(&invocation.context, 31, 0u);
+            runtime->eeScheduler().queueInvocationAfter(std::move(invocation),
+                                                         cdLatencyMicroseconds(function, sectors));
+        }
+    }
+
     void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t a0 = getRegU32(ctx, 4); // usually lbn
@@ -245,6 +294,8 @@ namespace ps2_stubs
 
         CdReadArgs selected{a0, a1, a2, "a0/a1/a2"};
         bool ok = tryRead(selected);
+        if (s3_trace_stubs_enabled())
+            std::fprintf(stderr, "[cdread] lsn=0x%x sectors=%u buf=0x%x ok=%d\n", a0, a1, a2, ok ? 1 : 0);
 
         if (!ok)
         {
@@ -317,6 +368,7 @@ namespace ps2_stubs
         {
             g_cdStreamingLbn = selected.lbn + selected.sectors;
             setReturnS32(ctx, 1); // command accepted/success
+            queueCdCallback(runtime, kCdFuncRead, selected.sectors);
             return;
         }
 
@@ -355,7 +407,12 @@ namespace ps2_stubs
 
     void sceCdCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, 0);
+        // Returns the previously registered callback, as libcdvd does; games use a second
+        // registration to confirm the first one took.
+        const uint32_t previous = g_cdCallback;
+        g_cdCallback = getRegU32(ctx, 4);
+        g_cdCallbackGp = getRegU32(ctx, 28);
+        setReturnU32(ctx, previous);
     }
 
     void sceCdChangeThreadPriority(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -392,6 +449,7 @@ namespace ps2_stubs
             std::memset(toc, 0, 1024);
         }
         setReturnS32(ctx, 1);
+        queueCdCallback(runtime, kCdFuncGetToc);
     }
 
     void sceCdInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -444,7 +502,9 @@ namespace ps2_stubs
 
     void sceCdPause(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        g_cdMotorStatus = 0x0A; // SCECdStatPause
         setReturnS32(ctx, 1);
+        queueCdCallback(runtime, kCdFuncPause);
     }
 
     void sceCdPosToInt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -651,17 +711,23 @@ namespace ps2_stubs
     void sceCdSeek(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         restartCdStreamAt(getRegU32(ctx, 4), runtime);
+        g_cdMotorStatus = 0x0A; // a completed seek leaves the drive paused at the target
         setReturnS32(ctx, 1);
+        queueCdCallback(runtime, kCdFuncSeek);
     }
 
     void sceCdStandby(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        g_cdMotorStatus = 0x0A; // standby completes as paused
         setReturnS32(ctx, 1);
+        queueCdCallback(runtime, kCdFuncStandby);
     }
 
     void sceCdStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, g_cdInitialized ? 6 : 0);
+        // Commands complete synchronously in this runtime, so report the motor state
+        // left by the last pause/stop/seek/standby (default: spinning).
+        setReturnS32(ctx, g_cdInitialized ? static_cast<int32_t>(g_cdMotorStatus) : 0);
     }
 
     void sceCdStInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -688,7 +754,9 @@ namespace ps2_stubs
 
     void sceCdStop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        g_cdMotorStatus = 0x00; // SCECdStatStop
         setReturnS32(ctx, 1);
+        queueCdCallback(runtime, kCdFuncStop);
     }
 
     void sceCdStPause(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -905,9 +973,65 @@ namespace ps2_stubs
         continueCdStRead(rdram, ctx, runtime, state);
     }
 
+    // sceCdStream(lbn, nsectors, buf, cmd, sceCdRMode *mode): the libcdvd entry the sceCdSt*
+    // wrappers funnel into (games that link their own copy of the wrappers, e.g. in a disc
+    // overlay, reach this instead of the individual stubs). READ returns
+    // (error << 16) | sectors read; the other commands return the stub's result.
     void sceCdStream(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, 1);
+        const uint32_t lbn = getRegU32(ctx, 4);
+        const uint32_t nsectors = getRegU32(ctx, 5);
+        const uint32_t buf = getRegU32(ctx, 6);
+        const uint32_t cmd = getRegU32(ctx, 7);
+        const uint32_t mode = getRegU32(ctx, 8); // fifth argument (t0)
+        auto setArgs = [&](uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3) {
+            ctx->r[4] = _mm_set_epi64x(0, static_cast<int64_t>(static_cast<int32_t>(a0)));
+            ctx->r[5] = _mm_set_epi64x(0, static_cast<int64_t>(static_cast<int32_t>(a1)));
+            ctx->r[6] = _mm_set_epi64x(0, static_cast<int64_t>(static_cast<int32_t>(a2)));
+            ctx->r[7] = _mm_set_epi64x(0, static_cast<int64_t>(static_cast<int32_t>(a3)));
+        };
+        switch (cmd)
+        {
+        case 1: // START
+            setArgs(lbn, mode, 0u, 0u);
+            sceCdStStart(rdram, ctx, runtime);
+            return;
+        case 2: // READ (non-blocking; the wrapper loops for blocking reads)
+        {
+            setArgs(nsectors, buf, 0u, 0u);
+            sceCdStRead(rdram, ctx, runtime);
+            const uint32_t sectors = getRegU32(ctx, 2) & 0xFFFFu;
+            setReturnU32(ctx, sectors);
+            return;
+        }
+        case 3: // STOP
+            sceCdStStop(rdram, ctx, runtime);
+            return;
+        case 4: // SEEK
+            setArgs(lbn, 0u, 0u, 0u);
+            sceCdStSeek(rdram, ctx, runtime);
+            return;
+        case 5: // INIT (bufmax, bankmax, buffer)
+            setArgs(lbn, nsectors, buf, 0u);
+            sceCdStInit(rdram, ctx, runtime);
+            return;
+        case 6: // STAT
+            sceCdStStat(rdram, ctx, runtime);
+            return;
+        case 7: // PAUSE
+            sceCdStPause(rdram, ctx, runtime);
+            return;
+        case 8: // RESUME
+            sceCdStResume(rdram, ctx, runtime);
+            return;
+        case 9: // SEEKF
+            setArgs(lbn, 0u, 0u, 0u);
+            sceCdStSeekF(rdram, ctx, runtime);
+            return;
+        default:
+            setReturnS32(ctx, 0);
+            return;
+        }
     }
 
     void sceCdStResume(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

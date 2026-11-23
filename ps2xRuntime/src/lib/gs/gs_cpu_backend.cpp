@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/ps2_gs_common.h"
 #include "runtime/gs/ps2_gs_psmct16.h"
@@ -394,8 +395,34 @@ namespace
         return {(smode2 & 0x1ull) != 0ull, ((smode2 >> 1) & 0x1ull) != 0ull};
     }
 
+    // Interlaced frame mode (INT=1, FFMD=0) scans a full-height frame out as two fields. A progressive
+    // PC display shows that whole frame as is ("weave"); line-doubling one field per vsync ("bob") halves
+    // the vertical resolution and makes the picture shimmer. PS2X_DEINTERLACE=bob restores the old output.
+    // The GS evaluates coverage and attributes at integer pixel positions (the pixel's top-left corner).
+    // Games rely on it: a 1:1 bilinear-filtered texture is sampled between texels, which softens
+    // dithered 8-bit artwork. PS2X_PIXEL_CENTER=half restores sampling at the pixel centre.
+    float pixelSampleOffset()
+    {
+        static const float offset = [] {
+            const char *v = std::getenv("PS2X_PIXEL_CENTER");
+            return (v && (v[0] == 'h' || v[0] == 'H')) ? 0.5f : 0.0f;
+        }();
+        return offset;
+    }
+
+    bool useBobDeinterlace()
+    {
+        static const bool bob = [] {
+            const char *v = std::getenv("PS2X_DEINTERLACE");
+            return v && (v[0] == 'b' || v[0] == 'B');
+        }();
+        return bob;
+    }
+
     void applyFieldPresentation(std::vector<uint8_t> &pixels, uint32_t width, uint32_t height, bool oddField)
     {
+        if (!useBobDeinterlace())
+            return;
         if (pixels.empty() || width == 0u || height < 2u)
             return;
         const std::vector<uint8_t> source = pixels;
@@ -1079,8 +1106,10 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
     else
     {
         const float invQ = 1.0f / fabsQ(q);
-        texUf = s * invQ * static_cast<float>(texW);
-        texVf = t * invQ * static_cast<float>(texH);
+        // The GS resolves texel addresses to 1/16 texel; rounding to that grid also keeps
+        // float error from tipping exact texel boundaries onto the previous texel.
+        texUf = std::nearbyint(s * invQ * static_cast<float>(texW) * 16.0f) * (1.0f / 16.0f);
+        texVf = std::nearbyint(t * invQ * static_cast<float>(texH) * 16.0f) * (1.0f / 16.0f);
     }
 
     auto samplePoint = [&](int sampleU, int sampleV) -> uint32_t
@@ -1227,21 +1256,20 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
             v1f = (v1.t / q1) * static_cast<float>(texH);
         }
 
-        float spriteW = static_cast<float>(spanX);
-        float spriteH = static_cast<float>(spanY);
-        if (spriteW < 1.0f)
-            spriteW = 1.0f;
-        if (spriteH < 1.0f)
-            spriteH = 1.0f;
 
+        const float spriteX0 = v0.x < v1.x ? v0.x - static_cast<float>(ofx) : v1.x - static_cast<float>(ofx);
+        const float spriteY0 = v0.y < v1.y ? v0.y - static_cast<float>(ofy) : v1.y - static_cast<float>(ofy);
+        const float spriteW = std::max(1.0f, std::fabs(v1.x - v0.x));
+        const float spriteH = std::max(1.0f, std::fabs(v1.y - v0.y));
+        const float sampleOffset = pixelSampleOffset();
         for (int y = drawY0; y <= drawY1; ++y)
         {
-            float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
+            float ty = (static_cast<float>(y) + sampleOffset - spriteY0) / spriteH;
             float texVf = v0f + (v1f - v0f) * ty;
 
             for (int x = drawX0; x <= drawX1; ++x)
             {
-                float tx = (static_cast<float>(x - unclippedX0) + 0.5f) / spriteW;
+                float tx = (static_cast<float>(x) + sampleOffset - spriteX0) / spriteW;
                 float texUf = u0f + (u1f - u0f) * tx;
                 uint32_t texel = 0xFFFF00FFu;
                 if (state.prim.fst)
@@ -1313,10 +1341,10 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
 
     for (int y = minY; y <= maxY; ++y)
     {
-        float py = static_cast<float>(y) + 0.5f;
+        float py = static_cast<float>(y) + pixelSampleOffset();
         for (int x = minX; x <= maxX; ++x)
         {
-            float px = static_cast<float>(x) + 0.5f;
+            float px = static_cast<float>(x) + pixelSampleOffset();
 
             float w0 = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
             float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;

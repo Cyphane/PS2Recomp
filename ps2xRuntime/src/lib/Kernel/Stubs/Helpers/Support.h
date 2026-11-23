@@ -28,6 +28,9 @@ namespace
     uint32_t g_cdStreamingLbn = 0;
     uint32_t g_cdStreamingEndLbn = 0xFFFFFFFFu;
     bool g_cdInitialized = false;
+    uint32_t g_cdMotorStatus = 0x06; // SCECdStatSpin
+    uint32_t g_cdCallback = 0;       // s3recomp: EE callback registered with sceCdCallback
+    uint32_t g_cdCallbackGp = 0;
 
     std::string toLowerAscii(std::string value)
     {

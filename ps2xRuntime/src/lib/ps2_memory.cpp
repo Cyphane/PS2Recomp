@@ -1,14 +1,359 @@
+#include "ipu/ps2_ipu.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_address.h"
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <algorithm>
+#include <chrono>
+#include <mutex>
+#include <thread>
+#include <deque>
+#include <condition_variable>
 #include <string>
 #include <vector>
+
+// s3recomp: graphics worker thread (PS2X_GFX_THREAD=1).
+//
+// On a PS2 the VIF1, VU1 and GS run alongside the EE. Here a VIF1 or GIF DMA kick copies its data,
+// hands it to one worker thread, and returns: the worker runs the VIF1 stream (VU1 microprograms,
+// XGKICK) and the GIF packets in kick order. The channel stays busy (CHCR.STR set) until the EE
+// thread applies the completion - D_STAT, the DMAC handler cause, STR/QWC - exactly as the
+// synchronous path would. Before the EE touches anything the worker may still be changing (DMA,
+// VIF1 and GIF registers, GS registers other than CSR, VU1 memory, the GS library calls), it waits
+// for the worker to finish ("sync"). Without PS2X_GFX_THREAD the same hooks only measure how much
+// work could have overlapped.
+namespace s3gsq
+{
+    void drain();   // ps2_runtime.cpp: wait for the GS thread's queue to empty
+    bool pending();
+}
+
+namespace s3timers
+{
+    void flushForRegisterAccess(PS2Memory &memory); // EeScheduler.cpp: apply pending EE timer cycles
+}
+
+namespace s3prof
+{
+    void registerThread(const char *name); // s3_profiler.cpp (PS2X_PROFILE=1)
+}
+
+namespace s3ff
+{
+    void checkFrame(uint64_t disp); // ps2_runtime.cpp
+}
+
+namespace s3gfx
+{
+    std::atomic<uint64_t> kickNs{0}, overlapNs{0}, syncs{0}, syncReason[6]{};
+    std::atomic<uint64_t> workerBusyNs{0}, syncWaitNs{0};
+    // Event counters for the [gfx] log line: 0 VIF1 kicks, 1 GIF kicks, 2 completions applied,
+    // 3 D_STAT reads, 4 VIF1/GIF CHCR reads, 5 CSR reads, 6 apply latency sum (us), 7 apply latency max (us),
+    // 8 completions applied by event, 9 by sync, 10 by register poll
+    std::atomic<uint64_t> stat[16]{};
+    static uint64_t pendingNs = 0;    // measurement: processing time not yet matched by a sync
+    static uint64_t pendingSince = 0; // measurement: end of the last kick's processing
+    static inline uint64_t nowNs()
+    {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count());
+    }
+
+    struct Job
+    {
+        uint32_t channel = 0; // 1 = VIF1, 2 = GIF
+        std::vector<std::vector<uint8_t>> chunks;
+        uint32_t fbrst = 0;   // EE VU0 FBRST at kick time (VU1 D/T bit enables)
+        uint32_t vpuStat = 0; // VU1 stop reason bits for VPU_STAT, applied at completion
+        bool vpuStatSet = false;
+        uint64_t doneNs = 0;  // when the worker finished it
+    };
+
+    thread_local Job *t_job = nullptr;           // worker: job being processed
+    thread_local bool t_onWorker = false;
+    thread_local uint32_t t_applyChannel = 0;    // EE: completion being applied
+    thread_local bool t_applyLast = false;       // EE: no more jobs outstanding on that channel
+    thread_local bool t_noSyncOnProcess = false; // EE: caller kicked asynchronously (sceDmaSend)
+    void setNoSyncOnProcess(bool on) { t_noSyncOnProcess = on; }
+
+    PS2Memory *g_mem = nullptr;
+    void (*g_wakeEe)() = nullptr;               // runtime: wake the EE scheduler
+    uint32_t (*g_captureFbrst)() = nullptr;     // runtime: current EE VU0 FBRST
+    void (*g_applyVpuStat)(uint32_t) = nullptr; // runtime: set VU1 bits of VPU_STAT
+
+    static std::mutex g_mutex;
+    static std::condition_variable g_workCv, g_idleCv;
+    static std::deque<Job> g_queue;
+    static std::vector<Job> g_done;
+    static std::atomic<int> g_outstanding{0};
+    static std::atomic<bool> g_donePending{false};
+    static int g_channelJobs[3] = {0, 0, 0}; // EE side: kicked but not yet applied, per channel
+    static bool g_started = false;
+
+    bool enabled()
+    {
+        static const bool on = [] {
+            const char *v = std::getenv("PS2X_GFX_THREAD");
+            return v && v[0] == '1';
+        }();
+        if (on)
+            return true;
+        // Test aid: PS2X_GFX_THREAD_AFTER=<seconds> starts inline and switches to the worker later
+        // (the switch is one-way and happens between kicks, when nothing is outstanding).
+        static const uint64_t afterNs = [] {
+            const char *v = std::getenv("PS2X_GFX_THREAD_AFTER");
+            return v ? nowNs() + static_cast<uint64_t>(std::strtoull(v, nullptr, 10)) * 1000000000ull : 0ull;
+        }();
+        static bool switched = false;
+        if (afterNs && !switched && nowNs() >= afterNs)
+        {
+            switched = true;
+            std::fprintf(stderr, "[gfx] switching VIF1/VU1/GS to the worker thread (PS2X_GFX_THREAD_AFTER)\n");
+        }
+        return switched;
+    }
+    bool onWorkerThread() { return t_onWorker; }
+    Job *currentJob() { return t_job; }
+    // PS2X_GFX_POLL_STATUS=1: DMA status/channel register reads see transfers still running instead
+    // of waiting for them (more overlap, but the game then sees states it never sees inline).
+    bool pollStatusReads()
+    {
+        static const bool on = [] {
+            const char *v = std::getenv("PS2X_GFX_POLL_STATUS");
+            return v && v[0] == '1';
+        }();
+        return on;
+    }
+    // For the VU1 callbacks (ps2_runtime.cpp), which run on the worker inside a job.
+    bool jobFbrst(uint32_t &fbrst)
+    {
+        if (!t_job)
+            return false;
+        fbrst = t_job->fbrst;
+        return true;
+    }
+    bool jobSetVpuStat(uint32_t bits)
+    {
+        if (!t_job)
+            return false;
+        t_job->vpuStat = bits;
+        t_job->vpuStatSet = true;
+        return true;
+    }
+
+    // The game feeds the worker one transfer at a time from its DMA completion handler, so each
+    // hand-off is on the critical path. Sleeping and waking a thread per hand-off can cost far more
+    // than the transfer itself (notably on Windows), so both sides spin briefly before sleeping.
+    // PS2X_GFX_SPIN_US sets how long (default 2000 us; 0 disables spinning).
+    uint64_t spinNs()
+    {
+        static const uint64_t ns = [] {
+            // Spinning needs spare cores: with fewer than 4 it steals time from the threads it waits for.
+            const char *v = std::getenv("PS2X_GFX_SPIN_US");
+            const uint64_t fallback = std::thread::hardware_concurrency() >= 4u ? 2000ull : 0ull;
+            return static_cast<uint64_t>(v ? std::strtoull(v, nullptr, 10) : fallback) * 1000ull;
+        }();
+        return ns;
+    }
+    // Spins until done() or the spin time runs out; returns done().
+    template <typename F>
+    static bool spinUntil(F &&done)
+    {
+        const uint64_t limit = spinNs();
+        if (limit == 0u)
+            return done();
+        const uint64_t end = nowNs() + limit;
+        for (uint32_t n = 0;; ++n)
+        {
+            if (done())
+                return true;
+            if ((n & 63u) == 63u)
+            {
+                if (nowNs() >= end)
+                    return done();
+                std::this_thread::yield();
+            }
+        }
+    }
+
+    static void workerMain()
+    {
+        s3prof::registerThread("graphics");
+        t_onWorker = true;
+        for (;;)
+        {
+            Job job;
+            spinUntil([] { return g_outstanding.load(std::memory_order_acquire) != 0; });
+            {
+                std::unique_lock<std::mutex> lock(g_mutex);
+                g_workCv.wait(lock, [] { return !g_queue.empty(); });
+                job = std::move(g_queue.front());
+                g_queue.pop_front();
+            }
+            const uint64_t start = nowNs();
+            t_job = &job;
+            try
+            {
+                g_mem->processPendingTransfers(); // processes t_job (see PS2Memory::processPendingTransfers)
+            }
+            catch (...)
+            {
+            }
+            t_job = nullptr;
+            workerBusyNs.fetch_add(nowNs() - start, std::memory_order_relaxed);
+            job.chunks.clear();
+            job.doneNs = nowNs();
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_done.push_back(std::move(job));
+                g_donePending.store(true, std::memory_order_release);
+                if (g_outstanding.fetch_sub(1, std::memory_order_acq_rel) == 1)
+                    g_idleCv.notify_all();
+            }
+            if (g_wakeEe)
+                g_wakeEe();
+        }
+    }
+
+    static void enqueue(uint32_t channel, std::vector<std::vector<uint8_t>> &&chunks)
+    {
+        if (!g_started)
+        {
+            g_started = true;
+            std::thread(workerMain).detach();
+        }
+        Job job;
+        job.channel = channel;
+        job.chunks = std::move(chunks);
+        stat[channel == 1u ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+        job.fbrst = g_captureFbrst ? g_captureFbrst() : 0u;
+        ++g_channelJobs[channel];
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_queue.push_back(std::move(job));
+            g_outstanding.fetch_add(1, std::memory_order_acq_rel);
+        }
+        g_workCv.notify_one();
+    }
+
+    // EE thread: apply finished jobs' completions in kick order.
+    thread_local int t_applyVia = 0; // 0 event, 1 sync, 2 register poll
+    static void applyCompletions()
+    {
+        if (!g_donePending.load(std::memory_order_acquire))
+            return;
+        std::vector<Job> done;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            done.swap(g_done);
+            g_donePending.store(false, std::memory_order_release);
+        }
+        const uint64_t now = nowNs();
+        for (Job &job : done)
+        {
+            const uint64_t latencyUs = (now - job.doneNs) / 1000u;
+            stat[2].fetch_add(1, std::memory_order_relaxed);
+            stat[6].fetch_add(latencyUs, std::memory_order_relaxed);
+            uint64_t prevMax = stat[7].load(std::memory_order_relaxed);
+            while (latencyUs > prevMax && !stat[7].compare_exchange_weak(prevMax, latencyUs))
+            {
+            }
+            stat[8 + t_applyVia].fetch_add(1, std::memory_order_relaxed);
+            if (job.vpuStatSet && g_applyVpuStat)
+                g_applyVpuStat(job.vpuStat);
+            t_applyChannel = job.channel;
+            t_applyLast = --g_channelJobs[job.channel] == 0;
+            g_mem->processPendingTransfers(); // applies t_applyChannel's completion
+            t_applyChannel = 0;
+        }
+    }
+
+    // EE thread: wait for the worker to finish everything kicked so far, then apply completions.
+    static void sync(int reason)
+    {
+        if (t_onWorker)
+            return;
+        if (!enabled())
+        {
+            if (!pendingNs)
+                return;
+            const uint64_t gap = nowNs() - pendingSince;
+            overlapNs.fetch_add(std::min(gap, pendingNs), std::memory_order_relaxed);
+            pendingNs = 0;
+            syncs.fetch_add(1, std::memory_order_relaxed);
+            syncReason[reason].fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (g_outstanding.load(std::memory_order_acquire) != 0)
+        {
+            const uint64_t start = nowNs();
+            spinUntil([] { return g_outstanding.load(std::memory_order_acquire) == 0; });
+            std::unique_lock<std::mutex> lock(g_mutex);
+            g_idleCv.wait(lock, [] { return g_outstanding.load(std::memory_order_acquire) == 0; });
+            lock.unlock();
+            syncWaitNs.fetch_add(nowNs() - start, std::memory_order_relaxed);
+            syncs.fetch_add(1, std::memory_order_relaxed);
+            syncReason[reason].fetch_add(1, std::memory_order_relaxed);
+        }
+        t_applyVia = 1;
+        applyCompletions();
+        t_applyVia = 0;
+    }
+    static inline void syncPoint(int reason) { sync(reason); }
+
+    // EE thread, non-blocking: apply completions of jobs that have finished.
+    void pollFromEe()
+    {
+        if (!t_onWorker && g_donePending.load(std::memory_order_relaxed))
+            applyCompletions();
+    }
+    void pollFromRegisterRead()
+    {
+        t_applyVia = 2;
+        pollFromEe();
+        t_applyVia = 0;
+    }
+    bool hasOutstanding() { return g_outstanding.load(std::memory_order_relaxed) != 0; }
+
+    static inline void kickDone(uint64_t start)
+    {
+        const uint64_t now = nowNs();
+        kickNs.fetch_add(now - start, std::memory_order_relaxed);
+        pendingNs += now - start;
+        pendingSince = now;
+    }
+    // 0 DMA status/control, 1 VIF1/GIF channel regs, 2 VIF/GIF regs, 3 GS priv regs, 4 VU1 memory, 5 other
+    void externalSyncPoint()
+    {
+        sync(5);
+        s3gsq::drain(); // the stubs read or change GS state directly
+    }
+    std::atomic<uint64_t> stubCalls[8]{}; // see the [gfx] log line
+    void countStub(int id) { stubCalls[id & 7].fetch_add(1, std::memory_order_relaxed); }
+    std::atomic<uint64_t> gsRegWaits[0x110]{}; // by (offset >> 4), for the log
+    static inline void gsRegSync(uint32_t address)
+    {
+        s3gsq::drain(); // privileged GS registers: queued packets come first
+        const uint64_t before = syncs.load(std::memory_order_relaxed);
+        sync(3);
+        if (syncs.load(std::memory_order_relaxed) != before)
+            gsRegWaits[((address - PS2_GS_PRIV_REG_BASE) >> 4) % 0x110u].fetch_add(1, std::memory_order_relaxed);
+    }
+    static inline int ioReason(uint32_t a)
+    {
+        if (a >= 0x1000E000u && a < 0x1000F000u) return 0;
+        if ((a >= 0x10009000u && a < 0x10009100u) || (a >= 0x1000A000u && a < 0x1000A100u)) return 1;
+        if ((a >= 0x10003000u && a < 0x10003100u) || (a >= 0x10003C00u && a < 0x10004000u)) return 2;
+        return -1;
+    }
+}
 
 namespace
 {
@@ -238,10 +583,54 @@ static inline uint32_t gs_vram_offset(uint32_t basePage, uint32_t x, uint32_t y,
     return basePage * 2048 + y * strideBytes + x * 4;
 }
 
+namespace
+{
+    // IPU emulation host hooks (ipu/ps2_ipu.cpp)
+    constexpr uint32_t kIntcCauseFlag = 0x80000000u; // INTC causes share the DMAC completion queue
+
+    struct IpuHostCallbacks
+    {
+        static uint32_t readReg(void *user, uint32_t address)
+        {
+            const auto &regs = static_cast<PS2Memory *>(user)->m_ioRegisters;
+            const auto it = regs.find(address);
+            return it != regs.end() ? it->second : 0u;
+        }
+        static void writeReg(void *user, uint32_t address, uint32_t value)
+        {
+            static_cast<PS2Memory *>(user)->m_ioRegisters[address] = value;
+        }
+        static uint8_t *guestPtr(void *user, uint32_t address, uint32_t bytes)
+        {
+            auto *mem = static_cast<PS2Memory *>(user);
+            if (address & 0x80000000u) // DMA addresses with bit 31 set refer to the scratchpad
+            {
+                const uint32_t off = address & (PS2_SCRATCHPAD_SIZE - 1u);
+                if (off + bytes > PS2_SCRATCHPAD_SIZE || !mem->getScratchpad())
+                    return nullptr;
+                return mem->getScratchpad() + off;
+            }
+            const uint32_t off = address & 0x1FFFFFFFu;
+            if (static_cast<uint64_t>(off) + bytes > PS2_RAM_SIZE || !mem->getRDRAM())
+                return nullptr;
+            return mem->getRDRAM() + off;
+        }
+        static void dmacDone(void *user, uint32_t channelBase, uint32_t cause)
+        {
+            static_cast<PS2Memory *>(user)->completeDmacChannel(channelBase, cause);
+        }
+        static void intcRaise(void *user, uint32_t cause)
+        {
+            static_cast<PS2Memory *>(user)->queueCompletedDmacCause(cause | kIntcCauseFlag);
+        }
+    };
+}
+
 PS2Memory::PS2Memory()
     : m_rdram(nullptr), m_scratchpad(nullptr), iop_ram(nullptr), m_seenGifCopy(false), m_gsVRAM(nullptr)
 {
     ps2SetScratchpadHostPtr(nullptr);
+    s3gfx::g_mem = this; // one PS2Memory per process
 }
 
 PS2Memory::~PS2Memory()
@@ -389,7 +778,18 @@ bool PS2Memory::initialize(size_t ramSize)
         // Initialize DMA registers
         memset(dma_regs, 0, sizeof(dma_regs));
 
-        return true;
+        {
+        ps2ipu::HostInterface ipuHost;
+        ipuHost.user = this;
+        ipuHost.readReg = &IpuHostCallbacks::readReg;
+        ipuHost.writeReg = &IpuHostCallbacks::writeReg;
+        ipuHost.guestPtr = &IpuHostCallbacks::guestPtr;
+        ipuHost.dmacDone = &IpuHostCallbacks::dmacDone;
+        ipuHost.intcRaise = &IpuHostCallbacks::intcRaise;
+        ps2ipu::attach(ipuHost);
+        ps2ipu::reset();
+    }
+    return true;
     }
     catch (const std::exception &e)
     {
@@ -534,6 +934,8 @@ uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offs
 
 const uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit) const
 {
+    if (physAddr >= 0x11008000u && physAddr < 0x11010000u)
+        s3gfx::syncPoint(4);
     auto mapRange = [&](uint32_t base, uint32_t rangeSize, const uint8_t *ptr) -> const uint8_t *
     {
         if (!ptr || physAddr < base)
@@ -629,6 +1031,7 @@ bool PS2Memory::tlbRead(uint32_t index, uint32_t &vpn, uint32_t &pfn, uint32_t &
     pfn = entry.pfn;
     mask = entry.mask;
     valid = entry.valid;
+
     return true;
 }
 
@@ -744,10 +1147,15 @@ uint32_t PS2Memory::read32(uint32_t address)
 
     if (isGsPrivReg(address))
     {
+        if (((address - PS2_GS_PRIV_REG_BASE) & ~0x7u) == kGsCsrRegOffset)
+            s3gfx::stat[5].fetch_add(1, std::memory_order_relaxed);
+        if (((address - PS2_GS_PRIV_REG_BASE) & ~0x7u) != kGsCsrRegOffset)
+            s3gfx::gsRegSync(address); // CSR is updated atomically by the GS, as on hardware
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
+            s3gsq::drain(); // FINISH/SIGNAL are set by the GS thread
             uint64_t val = gs_regs.csr.load();
             return (uint32_t)(val >> (off * 8));
         }
@@ -792,9 +1200,14 @@ uint64_t PS2Memory::read64(uint32_t address)
 
     if (isGsPrivReg(address))
     {
+        if (((address - PS2_GS_PRIV_REG_BASE) & ~0x7u) == kGsCsrRegOffset)
+            s3gfx::stat[5].fetch_add(1, std::memory_order_relaxed);
+        if (((address - PS2_GS_PRIV_REG_BASE) & ~0x7u) != kGsCsrRegOffset)
+            s3gfx::gsRegSync(address); // CSR is updated atomically by the GS, as on hardware
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
+            s3gsq::drain(); // FINISH/SIGNAL are set by the GS thread
             return gs_regs.csr.load();
         }
         uint64_t *reg = gsRegPtr(gs_regs, address);
@@ -819,6 +1232,10 @@ uint64_t PS2Memory::read64(uint32_t address)
         return loadScalar<uint64_t>(vuMem, vuOffset, vuLimit, "read64 vu", address);
     }
 
+    if (ps2ipu::handlesRegister(physAddr))
+    {
+        return ps2ipu::read64(physAddr);
+    }
     // 64-bit IO read: compose from the two adjacent 32-bit IO register slots
     // to avoid any side-effects from read32 handlers.
     if (isIoRegister(address))
@@ -858,6 +1275,12 @@ __m128i PS2Memory::read128(uint32_t address)
         return _mm_loadu_si128(reinterpret_cast<const __m128i *>(vuMem + vuOffset));
     }
 
+    if ((address & 0x1FFFFFF0u) == 0x10007000u) // IPUout FIFO
+    {
+        alignas(16) uint8_t q[16];
+        ps2ipu::fifoRead(q);
+        return _mm_load_si128(reinterpret_cast<const __m128i *>(q));
+    }
     // 128-bit reads are primarily for quad-word loads in the EE, which are only valid for RAM areas
     // Return zeroes for unsupported areas
     return _mm_setzero_si128();
@@ -953,6 +1376,8 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
 
     if (isGsPrivReg(address))
     {
+        if (((address - PS2_GS_PRIV_REG_BASE) & ~0x7u) != kGsCsrRegOffset)
+            s3gfx::gsRegSync(address); // CSR updates are atomic and need no wait
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
@@ -1013,6 +1438,8 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
 
     if (isGsPrivReg(address))
     {
+        if (((address - PS2_GS_PRIV_REG_BASE) & ~0x7u) != kGsCsrRegOffset)
+            s3gfx::gsRegSync(address); // CSR updates are atomic and need no wait
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
@@ -1052,6 +1479,11 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
                 markVU1CodeModified();
             return;
         }
+    }
+    if (ps2ipu::handlesRegister(physAddr))
+    {
+        ps2ipu::write64(physAddr, value);
+        return;
     }
     if (isIoRegister(physAddr))
     {
@@ -1111,6 +1543,13 @@ void PS2Memory::write128(uint32_t address, __m128i value)
             return;
         }
     }
+    if ((address & 0x1FFFFFF0u) == 0x10007010u) // IPUin FIFO
+    {
+        alignas(16) uint8_t q[16];
+        _mm_store_si128(reinterpret_cast<__m128i *>(q), value);
+        ps2ipu::fifoWrite(q);
+        return;
+    }
     if (isIoRegister(physAddr))
     {
         // Non-RAM 128-bit stores are modeled as two 64-bit stores.
@@ -1124,10 +1563,15 @@ void PS2Memory::write128(uint32_t address, __m128i value)
 
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
+    // DMA control/status writes and VIF1/GIF channel setup and kicks need no wait: completions are
+    // applied on this thread, and kicks queue behind the worker. VIF/GIF register writes do.
+    if (s3gfx::ioReason(address) == 2)
+        s3gfx::syncPoint(2);
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
+        s3timers::flushForRegisterAccess(*this);
         EeTimer &timer = m_eeTimers[timerIndex];
         switch (timerOffset)
         {
@@ -1179,22 +1623,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         return true;
     }
 
-    if (address >= 0x10002000 && address <= 0x10002030)
+    if (ps2ipu::handlesRegister(address))
     {
-        if (address == 0x10002010)
-        {
-            m_ioRegisters[address] = value & ~(1u << 31);
-            if (value & (1u << 30))
-            {
-                m_ioRegisters[0x10002000] = 0;
-                m_ioRegisters[0x10002020] = 0;
-                m_ioRegisters[0x10002030] = 0;
-            }
-        }
-        else
-        {
-            m_ioRegisters[address] = value;
-        }
+        ps2ipu::write32(address, value);
         return true;
     }
 
@@ -1302,6 +1733,11 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             }
 
             const uint32_t channelBase = address & 0xFFFFFF00;
+            if (channelBase == 0x1000B000u || channelBase == 0x1000B400u)
+            {
+                ps2ipu::dmaStart(channelBase); // CHCR was stored above
+                return true;
+            }
             const uint32_t madr = m_ioRegisters[channelBase + 0x10];
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
@@ -1562,7 +1998,77 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     (channelBase == 0x1000A000u) ? (m_gifPacketCallback || m_gifArbiter != nullptr) : true;
                 if (autoProcessTransfers)
                 {
-                    processPendingTransfers();
+                    const bool graphicsChannel = channelBase == 0x1000A000u || channelBase == 0x10009000u;
+                    if (graphicsChannel) // fast-forward: a new frame starts once the display buffer has changed
+                        s3ff::checkFrame(gs_regs.dispfb1 ^ (gs_regs.dispfb2 << 1) ^ (gs_regs.dispfb2 >> 63));
+                    if (graphicsChannel && s3gfx::enabled() && !s3gfx::onWorkerThread() && m_pendingVif0Transfers.empty())
+                    {
+                        // Graphics worker: copy each transfer's data now (as the chain walk already
+                        // did for chains) so the EE may reuse its buffers, and queue it in kick order.
+                        uint32_t observedGifQwc = 0u;
+                        for (const auto &transfer : m_pendingGifTransfers)
+                        {
+                            const uint64_t transferQwc = !transfer.chainData.empty() ? (transfer.chainData.size() / 16u) : transfer.qwc;
+                            observedGifQwc = static_cast<uint32_t>(std::min<uint64_t>(16u, static_cast<uint64_t>(observedGifQwc) + transferQwc));
+                        }
+                        if (observedGifQwc != 0u)
+                        {
+                            uint32_t &gifStat = m_ioRegisters[0x10003020u];
+                            gifStat = (gifStat & ~0x1F000000u) | (observedGifQwc << 24u);
+                        }
+                        auto snapshot = [&](PendingTransfer &pt) -> std::vector<uint8_t> {
+                            if (!pt.chainData.empty())
+                                return std::move(pt.chainData);
+                            std::vector<uint8_t> data;
+                            if (pt.qwc == 0u)
+                                return data;
+                            uint32_t srcPhys = 0;
+                            try
+                            {
+                                srcPhys = translateAddress(pt.srcAddr);
+                            }
+                            catch (const std::exception &)
+                            {
+                                return data;
+                            }
+                            const uint8_t *base = pt.fromScratchpad ? m_scratchpad : m_rdram;
+                            const uint32_t limit = pt.fromScratchpad ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+                            uint32_t bytesLeft = static_cast<uint32_t>(std::min<uint64_t>(static_cast<uint64_t>(pt.qwc) * 16ull, 0xFFFFFFF0ull));
+                            data.reserve(bytesLeft);
+                            while (bytesLeft > 0u)
+                            {
+                                if (srcPhys >= limit)
+                                    srcPhys = 0;
+                                const uint32_t chunk = std::min(bytesLeft, limit - srcPhys);
+                                if (chunk == 0u)
+                                    break;
+                                data.insert(data.end(), base + srcPhys, base + srcPhys + chunk);
+                                bytesLeft -= chunk;
+                                srcPhys += chunk;
+                            }
+                            return data;
+                        };
+                        auto queue = [&](std::vector<PendingTransfer> &list, uint32_t channel) {
+                            if (list.empty())
+                                return;
+                            std::vector<std::vector<uint8_t>> chunks;
+                            for (PendingTransfer &pt : list)
+                                chunks.push_back(snapshot(pt));
+                            list.clear();
+                            s3gfx::enqueue(channel, std::move(chunks));
+                        };
+                        queue(m_pendingGifTransfers, 2u); // the synchronous path also runs GIF before VIF1
+                        queue(m_pendingVif1Transfers, 1u);
+                    }
+                    else
+                    {
+                        const uint64_t kickStart = s3gfx::nowNs();
+                        if (graphicsChannel)
+                            s3gfx::stat[channelBase == 0x10009000u ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+                        processPendingTransfers();
+                        if (graphicsChannel)
+                            s3gfx::kickDone(kickStart);
+                    }
                 }
             }
         }
@@ -1662,6 +2168,55 @@ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
 
 void PS2Memory::processPendingTransfers()
 {
+    if (s3gfx::Job *job = s3gfx::currentJob())
+    {
+        // Graphics worker: run one kicked transfer (its data was copied at kick time).
+        for (const auto &chunk : job->chunks)
+        {
+            if (chunk.empty())
+                continue;
+            if (job->channel == 1u)
+                processVIF1Data(chunk.data(), static_cast<uint32_t>(chunk.size()));
+            else
+            {
+                m_seenGifCopy = true;
+                m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
+                submitGifPacket(GifPathId::Path3, chunk.data(), static_cast<uint32_t>(chunk.size()), false);
+            }
+        }
+        if (m_gifArbiter)
+            m_gifArbiter->drain();
+        return;
+    }
+    if (s3gfx::t_applyChannel != 0u)
+    {
+        // EE thread: a worker job finished; complete its DMA as the synchronous path does below.
+        constexpr uint32_t D_STAT = 0x1000E010u;
+        const uint32_t channelBit = s3gfx::t_applyChannel == 1u ? 1u : 2u;
+        const uint32_t channelBase = s3gfx::t_applyChannel == 1u ? 0x10009000u : 0x1000A000u;
+        uint32_t dstat = m_ioRegisters.count(D_STAT) ? m_ioRegisters[D_STAT] : 0u;
+        dstat |= (1u << channelBit);
+        if (((dstat & 0x3FFu) & ((dstat >> 16) & 0x3FFu)) != 0u)
+            dstat |= (1u << 31);
+        else
+            dstat &= ~(1u << 31);
+        m_ioRegisters[D_STAT] = dstat;
+        queueCompletedDmacCause(channelBit);
+        if (s3gfx::t_applyLast)
+        {
+            m_ioRegisters[channelBase + 0x00] &= ~0x100u;
+            m_ioRegisters[channelBase + 0x20] = 0;
+        }
+        return;
+    }
+    if (s3gfx::enabled())
+    {
+        const bool anyPending = !m_pendingGifTransfers.empty() || !m_pendingVif0Transfers.empty() || !m_pendingVif1Transfers.empty();
+        if (!anyPending && s3gfx::t_noSyncOnProcess)
+            return; // sceDmaSend: its kick went to the worker; nothing to do here
+        s3gfx::sync(5); // direct callers (library stubs) expect everything kicked before to be done
+    }
+
     const bool hadGif = !m_pendingGifTransfers.empty();
     uint32_t observedGifQwc = 0u;
     for (const auto &transfer : m_pendingGifTransfers)
@@ -2280,10 +2835,26 @@ int PS2Memory::pollDmaRegisters()
 
 uint32_t PS2Memory::readIORegister(uint32_t address)
 {
+    // DMA status/control and VIF1/GIF channel registers: apply whatever the worker has finished and
+    // read on, as on hardware (a polling loop simply waits for the transfer). VIF/GIF registers,
+    // which the worker changes as it goes, wait for it. Reads during sceDmaSend only fetch the
+    // configured CHCR bits, which the worker never changes.
+    if (address == 0x1000E010u)
+        s3gfx::stat[3].fetch_add(1, std::memory_order_relaxed);
+    else if (address == 0x10009000u || address == 0x1000A000u)
+        s3gfx::stat[4].fetch_add(1, std::memory_order_relaxed);
+    if (const int r = s3gfx::ioReason(address); r >= 0 && !s3gfx::t_noSyncOnProcess)
+    {
+        if (r == 2 || !s3gfx::enabled() || !s3gfx::pollStatusReads())
+            s3gfx::syncPoint(r);
+        else
+            s3gfx::pollFromRegisterRead();
+    }
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
+        s3timers::flushForRegisterAccess(*this);
         const EeTimer &timer = m_eeTimers[timerIndex];
         switch (timerOffset)
         {
@@ -2308,6 +2879,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
+            s3gsq::drain(); // FINISH/SIGNAL are set by the GS thread
             return static_cast<uint32_t>((gs_regs.csr.load() >> (off * 8u)) & 0xFFFFFFFFull);
         }
         if (uint64_t *reg = gsRegPtr(gs_regs, address))
@@ -2317,30 +2889,14 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         return 0u;
     }
 
-    if (address >= 0x10002000 && address <= 0x10002030)
+    if (ps2ipu::handlesRegister(address))
     {
-        uint32_t val = 0;
-        switch (address)
-        {
-        case 0x10002000:
-            val = m_ioRegisters[address];
-            break;
-        case 0x10002010:
-            val = m_ioRegisters[address] & ~(1u << 31);
-            break;
-        case 0x10002020:
-        case 0x10002030:
-            val = m_ioRegisters[address];
-            break;
-        default:
-            val = 0;
-            break;
-        }
-        return val;
+        return ps2ipu::read32(address);
     }
 
     if (address == 0x10003020u) // GIF_STAT
     {
+        s3timers::flushForRegisterAccess(*this); // time passing clears FQC (see advanceEeTimers)
         uint32_t stat = m_ioRegisters.count(address) ? m_ioRegisters[address] : 0u;
         const uint32_t mode = m_ioRegisters.count(0x10003010u) ? m_ioRegisters[0x10003010u] : 0u;
         const uint32_t ctrl = m_ioRegisters.count(0x10003000u) ? m_ioRegisters[0x10003000u] : 0u;

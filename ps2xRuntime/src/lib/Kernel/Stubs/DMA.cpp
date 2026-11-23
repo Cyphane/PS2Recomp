@@ -1,4 +1,20 @@
 #include "Common.h"
+
+namespace s3gfx
+{
+    void setNoSyncOnProcess(bool on);
+    void externalSyncPoint();
+    void countStub(int id);
+}
+namespace
+{
+    // s3recomp: sceDmaSend only starts a transfer; with the graphics worker it must not wait for it.
+    struct AsyncKick
+    {
+        AsyncKick() { s3gfx::setNoSyncOnProcess(true); }
+        ~AsyncKick() { s3gfx::setNoSyncOnProcess(false); }
+    };
+}
 #include "DMA.h"
 
 namespace ps2_stubs
@@ -167,7 +183,34 @@ namespace ps2_stubs
 
     void sceDmaRecvN(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceDmaRecvN", rdram, ctx, runtime);
+        // s3recomp: normal-mode receive, i.e. a transfer *into* main RAM. On the EE the only
+        // channels that receive this way are fromSPR (scratchpad -> RAM) and fromIPU; the
+        // scratchpad source address (SADR) is programmed by the game through the channel
+        // registers before the call. PS2Memory performs the fromSPR copy when CHCR.STR is set.
+        if (!runtime)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+        const uint32_t channelBase = resolveDmaChannelBase(rdram, getRegU32(ctx, 4));
+        if (channelBase == 0)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+        const uint32_t madr = toDmaPhys(getRegU32(ctx, 5));
+        const uint32_t qwc = normalizeQwcFromArg(getRegU32(ctx, 6));
+        PS2Memory &mem = runtime->memory();
+        const uint32_t tie = mem.readIORegister(channelBase + 0x00u) & 0x00000040u;
+        mem.writeIORegister(channelBase + 0x20u, qwc & 0xFFFFu);
+        mem.writeIORegister(channelBase + 0x10u, madr);
+        mem.writeIORegister(channelBase + 0x00u, 0x00000100u | tie); // STR=1, normal mode, DIR=0 (to memory)
+        mem.processPendingTransfers();
+        {
+            std::lock_guard<std::mutex> lock(g_dmaStubMutex);
+            g_dmaPendingPolls[channelBase] = 1;
+        }
+        setReturnS32(ctx, 0);
     }
 
     void sceDmaReset(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -201,31 +244,42 @@ namespace ps2_stubs
 
     void sceDmaSend(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        s3gfx::countStub(5);
+        AsyncKick asyncKick;
         setReturnS32(ctx, submitDmaSend(rdram, ctx, runtime, false));
     }
 
     void sceDmaSendI(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        s3gfx::countStub(5);
+        AsyncKick asyncKick;
         setReturnS32(ctx, submitDmaSend(rdram, ctx, runtime, false));
     }
 
     void sceDmaSendM(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        s3gfx::countStub(5);
+        AsyncKick asyncKick;
         setReturnS32(ctx, submitDmaSend(rdram, ctx, runtime, false));
     }
 
     void sceDmaSendN(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        s3gfx::countStub(5);
+        AsyncKick asyncKick;
         setReturnS32(ctx, submitDmaSend(rdram, ctx, runtime, true));
     }
 
     void sceDmaSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        s3gfx::countStub(6);
+        s3gfx::externalSyncPoint(); // the stub polls with a fixed timeout: let the worker finish first
         setReturnS32(ctx, submitDmaSync(rdram, ctx, runtime));
     }
 
     void sceDmaSyncN(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        s3gfx::externalSyncPoint();
         setReturnS32(ctx, submitDmaSync(rdram, ctx, runtime));
     }
 

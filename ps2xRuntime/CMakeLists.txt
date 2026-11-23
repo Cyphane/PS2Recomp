@@ -383,6 +383,8 @@ add_library(ps2_runtime STATIC
     src/lib/gs/ps2_gs_memory.cpp
     src/lib/gs/gs_frontend.cpp
     src/lib/gs/gs_cpu_backend.cpp
+    src/lib/gs/gs_vulkan_backend.cpp
+    thirdparty/volk/volk.c
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
@@ -393,7 +395,18 @@ add_library(ps2_runtime STATIC
     src/lib/vu/ps2_vu1_core.cpp
     src/lib/vu/ps2_vu1_upper.cpp
     src/lib/vu/ps2_vu1_lower.cpp
+    src/lib/vu/ps2_vu1_fast_core.cpp
+    src/lib/vu/ps2_vu1_fast_upper.cpp
+    src/lib/vu/ps2_vu1_fast_lower.cpp
     src/lib/games_database.cpp
+    src/lib/s3_overlay.cpp
+    src/lib/s3_profiler.cpp
+    src/lib/ipu/ps2_ipu.cpp
+    src/lib/ipu/IPU/IPU.cpp
+    src/lib/ipu/IPU/IPU_Fifo.cpp
+    src/lib/ipu/IPU/IPU_MultiISA.cpp
+    src/lib/ipu/IPU/yuv2rgb.cpp
+    src/lib/ipu/IPU/IPUdither.cpp
 )
 
 if(PS2X_ENABLE_RUNTIME_LOGS)
@@ -429,6 +442,21 @@ target_compile_definitions(ps2_runtime PRIVATE
     PS2X_HAS_FFMPEG=$<BOOL:${PS2X_ENABLE_FFMPEG}>
 )
 
+# s3recomp: Vulkan GS renderer. volk loads vulkan-1 / libvulkan at run time, so nothing extra is linked.
+enable_language(C)
+target_include_directories(ps2_runtime PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/vulkan/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/volk
+)
+target_compile_definitions(ps2_runtime PRIVATE VK_NO_PROTOTYPES)
+set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/gs/gs_vulkan_backend.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/volk/volk.c
+    PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
+if(UNIX)
+    target_link_libraries(ps2_runtime PRIVATE ${CMAKE_DL_LIBS})
+endif()
+
 file(GLOB_RECURSE KERNEL_SRC_FILES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel/*.cpp"
 )
@@ -448,6 +476,20 @@ if(EXISTS "${RUNNER_MAIN_CPP}")
     list(APPEND RUNNER_SRC_FILES "${RUNNER_MAIN_CPP}")
 elseif(EXISTS "${ROOT_MAIN_CPP}")
     list(APPEND RUNNER_SRC_FILES "${ROOT_MAIN_CPP}")
+endif()
+list(REMOVE_DUPLICATES RUNNER_SRC_FILES)
+
+# s3recomp: hand-written runner sources (launcher main, OS helpers) must stay out of the
+# unity batches so <windows.h> / raylib.h never share a translation unit with generated code.
+file(GLOB S3_RUNNER_HANDWRITTEN CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/s3_*.cpp"
+)
+if(S3_RUNNER_HANDWRITTEN)
+    set_source_files_properties(${S3_RUNNER_HANDWRITTEN} PROPERTIES
+        SKIP_UNITY_BUILD_INCLUSION ON
+        SKIP_PRECOMPILE_HEADERS ON
+    )
 endif()
 
 if(PS2X_IS_ANDROID)
@@ -511,6 +553,24 @@ target_link_libraries(ps2EntryRunner
     PRIVATE
     ps2_runtime
 )
+
+# s3recomp: native VU1 programs written by ps2_vu1gen (S3Launcher does this itself in bundled builds).
+set(PS2X_VU1_GENERATED_DIR "" CACHE PATH "ps2_vu1gen output folder to compile into ps2EntryRunner")
+if(PS2X_VU1_GENERATED_DIR)
+    file(GLOB PS2X_VU1_GENERATED_SOURCES CONFIGURE_DEPENDS "${PS2X_VU1_GENERATED_DIR}/*.cpp")
+    target_sources(ps2EntryRunner PRIVATE ${PS2X_VU1_GENERATED_SOURCES})
+    set_source_files_properties(${PS2X_VU1_GENERATED_SOURCES}
+        PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON
+                   INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu)
+    if(NOT MSVC)
+        # Large straight-line code: optimise it at compile time rather than in the LTO link.
+        set_source_files_properties(${PS2X_VU1_GENERATED_SOURCES} PROPERTIES COMPILE_OPTIONS "-fno-lto")
+    endif()
+endif()
+if(WIN32)
+    # s3recomp launcher: native folder picker / Explorer integration
+    target_link_libraries(ps2EntryRunner PRIVATE ole32 shell32 uuid)
+endif()
 
 if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     target_sources(ps2EntryRunner PRIVATE
@@ -590,6 +650,23 @@ endif()
 if(PS2X_IS_ANDROID)
     target_sources(ps2EntryRunner PRIVATE src/lib/ps2_android_runtime.cpp)
 endif()
+
+# s3recomp: VU1 program generator, run by S3Launcher to turn the game's VU1 microprograms into C++
+# that is compiled into the game. It uses the VU1 fast core only to decode instructions.
+add_executable(ps2_vu1gen
+    tools/vu1gen/ps2_vu1gen.cpp
+    tools/vu1gen/ps2_vu1gen_stubs.cpp
+    src/lib/vu/ps2_vu1_fast_core.cpp
+    src/lib/vu/ps2_vu1_fast_upper.cpp
+    src/lib/vu/ps2_vu1_fast_lower.cpp
+)
+target_include_directories(ps2_vu1gen PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/runtime
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/lib
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu
+)
+set_target_properties(ps2_vu1gen PROPERTIES UNITY_BUILD OFF)
 
 install(TARGETS ps2_runtime ps2EntryRunner
     RUNTIME DESTINATION bin

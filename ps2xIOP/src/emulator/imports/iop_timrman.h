@@ -1,4 +1,6 @@
 #pragma once
+#include <string>
+#include <vector>
 
 #include <array>
 #include <cstddef>
@@ -17,6 +19,7 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle);
         void serviceDue(uint64_t currentCycle, IopGuestExecutor &executor);
         [[nodiscard]] uint64_t nextEventCycle(uint64_t fallback) const noexcept;
+        void appendDebug(std::vector<std::string> &out) const; // s3recomp
 
     private:
         struct Callback
@@ -46,6 +49,7 @@ namespace ps2x::iop::detail
             uint64_t overflowCycle = UINT64_MAX;
             bool configured = false;
             bool running = false;
+            uint64_t s3Fired = 0u;
 
             Callback compareCallback;
             Callback overflowCallback;

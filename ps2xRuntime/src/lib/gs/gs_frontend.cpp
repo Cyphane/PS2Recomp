@@ -9,6 +9,17 @@
 #include <cstring>
 #include <iostream>
 #include <sstream>
+#include <algorithm>
+#include <cstdlib>
+
+// s3recomp debug (PS2X_GS_TRACE): per-second draw statistics.
+uint64_t s3_gsPrimStats[8] = {};
+extern uint64_t s3_vifStats[6];
+struct S3StripStats { float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f; double z0 = 1e18, z1 = -1e18; int a0 = 999, a1 = -1; uint32_t n = 0;
+    uint32_t fbp = 0, fbw = 0, psm = 0, fbmsk = 0, zbp = 0, zpsm = 0, zmsk = 0, ofx = 0, ofy = 0, sx0 = 0, sx1 = 0, sy0 = 0, sy1 = 0, ctxt = 0, tme = 0, abe = 0; uint64_t test = 0, alpha = 0; };
+S3StripStats s3_strip;
+FILE *s3_drawLog = nullptr;      // s3recomp debug: one-frame primitive log (PS2X_DRAW_LOG trigger file)
+uint32_t s3_drawLogFrames = 0;
 
 namespace
 {
@@ -557,6 +568,71 @@ void GS::latchHostPresentationFrame()
     const uint32_t width = frame.width;
     const uint32_t height = frame.height;
     const bool usedPreferred = frame.usedPreferred;
+    {
+        static const bool trace = std::getenv("PS2X_GS_TRACE") != nullptr;
+        static uint32_t traceCount = 0;
+        // s3recomp debug: touch the file named by PS2X_VRAM_DUMP to get a raw 4MB VRAM dump next to it (".bin").
+        static const char *dumpTrigger = std::getenv("PS2X_VRAM_DUMP");
+        if (dumpTrigger && (traceCount % 15u) == 0u)
+        {
+            if (FILE *t = std::fopen(dumpTrigger, "rb"))
+            {
+                std::fclose(t);
+                std::remove(dumpTrigger);
+                std::vector<uint8_t> vram;
+                {
+                    std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+                    if (m_backend)
+                        m_backend->SnapshotVram(vram);
+                }
+                const std::string out = std::string(dumpTrigger) + ".bin";
+                if (FILE *o = std::fopen(out.c_str(), "wb"))
+                {
+                    std::fwrite(vram.data(), 1, vram.size(), o);
+                    std::fclose(o);
+                }
+                std::fprintf(stderr, "[gs-vram] dumped %zu bytes to %s\n", vram.size(), out.c_str());
+            }
+        }
+        static const char *drawTrigger = std::getenv("PS2X_DRAW_LOG");
+        if (s3_drawLog && ++s3_drawLogFrames >= 2u)
+        {
+            std::fclose(s3_drawLog);
+            s3_drawLog = nullptr;
+            std::fprintf(stderr, "[gs-drawlog] closed\n");
+        }
+        if (drawTrigger && !s3_drawLog)
+        {
+            if (FILE *t = std::fopen(drawTrigger, "rb"))
+            {
+                std::fclose(t);
+                std::remove(drawTrigger);
+                s3_drawLog = std::fopen((std::string(drawTrigger) + ".txt").c_str(), "w");
+                s3_drawLogFrames = 0;
+            }
+        }
+        if (trace && (traceCount++ % 60u) == 0u)
+            std::fprintf(stderr, "[gs-present] pmode=%llx smode2=%llx dispfb1=%llx display1=%llx dispfb2=%llx display2=%llx pref=%d prefFbp=%x -> has=%d dispFbp=%x srcFbp=%x %ux%u usedPref=%d\n",
+                         (unsigned long long)request.pmode, (unsigned long long)request.smode2,
+                         (unsigned long long)request.dispfb1, (unsigned long long)request.display1,
+                         (unsigned long long)request.dispfb2, (unsigned long long)request.display2,
+                         (int)request.hasPreferredSource, request.preferredDestFbp, (int)hasFrame, displayFbp, sourceFbp, width, height, (int)usedPreferred);
+        if (trace && (traceCount % 60u) == 1u)
+        {
+            std::fprintf(stderr, "[gs-stats] prims pt=%llu ln=%llu ls=%llu tri=%llu strip=%llu fan=%llu sprite=%llu | vif1 calls=%llu bytes=%llu mscal=%llu mscnt=%llu direct=%llu\n",
+                         (unsigned long long)s3_gsPrimStats[0], (unsigned long long)s3_gsPrimStats[1], (unsigned long long)s3_gsPrimStats[2],
+                         (unsigned long long)s3_gsPrimStats[3], (unsigned long long)s3_gsPrimStats[4], (unsigned long long)s3_gsPrimStats[5],
+                         (unsigned long long)s3_gsPrimStats[6], (unsigned long long)s3_vifStats[0], (unsigned long long)s3_vifStats[1],
+                         (unsigned long long)s3_vifStats[2], (unsigned long long)s3_vifStats[3], (unsigned long long)s3_vifStats[4]);
+            const S3StripStats &st = s3_strip;
+            std::fprintf(stderr, "[gs-strip] n=%u x=%.1f..%.1f y=%.1f..%.1f z=%.0f..%.0f a=%d..%d ctx=%u tme=%u abe=%u frame fbp=%x fbw=%u psm=%x msk=%x zbuf zbp=%x psm=%x zmsk=%u ofs=%.1f,%.1f scissor=%u..%u,%u..%u test=%llx alpha=%llx\n",
+                         st.n, st.x0, st.x1, st.y0, st.y1, st.z0, st.z1, st.a0, st.a1, st.ctxt, st.tme, st.abe, st.fbp, st.fbw, st.psm, st.fbmsk, st.zbp, st.zpsm, st.zmsk,
+                         st.ofx / 16.0, st.ofy / 16.0, st.sx0, st.sx1, st.sy0, st.sy1, (unsigned long long)st.test, (unsigned long long)st.alpha);
+            s3_strip = S3StripStats{};
+            for (auto &v : s3_gsPrimStats) v = 0;
+            for (auto &v : s3_vifStats) v = 0;
+        }
+    }
     {
         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
         m_hostPresentationFrame = std::move(frame.pixels);
@@ -1384,6 +1460,19 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     case GS_REG_TRXDIR:
     {
         m_trxdir = static_cast<uint32_t>(value & 0x3);
+        {
+            static const bool trace = std::getenv("PS2X_GS_TRACE") != nullptr;
+            static uint64_t lastKey = ~0ull;
+            static uint32_t traceCount = 0;
+            const uint64_t key = (uint64_t)m_bitbltbuf.dbp | ((uint64_t)m_bitbltbuf.dpsm << 16) | ((uint64_t)m_trxreg.rrw << 24) | ((uint64_t)m_trxreg.rrh << 40);
+            if (trace && key != lastKey && traceCount < 400u)
+            {
+                ++traceCount;
+                lastKey = key;
+                std::fprintf(stderr, "[gs-trx] dir=%u dbp=%x dbw=%u dpsm=%x rr=%ux%u dsa=%u,%u\n", m_trxdir, m_bitbltbuf.dbp, m_bitbltbuf.dbw,
+                             m_bitbltbuf.dpsm, m_trxreg.rrw, m_trxreg.rrh, m_trxpos.dsax, m_trxpos.dsay);
+            }
+        }
 
         if (m_backend)
         {
@@ -1525,10 +1614,26 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     recordRegisterDebugEventUnlocked(regAddr, value);
 }
 
+namespace s3ff
+{
+    extern std::atomic<bool> skipDraw; // fast-forward: this frame is not drawn (ps2_runtime.cpp)
+}
+
 void GS::vertexKick(bool drawing)
 {
     ++m_vtxCount;
     ++m_vtxIndex;
+    if (m_prim.type == GS_PRIM_TRISTRIP || m_prim.type == GS_PRIM_TRIFAN || m_prim.type == GS_PRIM_TRIANGLE)
+    {
+        const GSVertex &v = m_vtxQueue[(m_vtxCount - 1) % kMaxVerts];
+        S3StripStats &st = s3_strip;
+        st.x0 = std::min(st.x0, v.x); st.x1 = std::max(st.x1, v.x); st.y0 = std::min(st.y0, v.y); st.y1 = std::max(st.y1, v.y);
+        st.z0 = std::min(st.z0, v.z); st.z1 = std::max(st.z1, v.z); st.a0 = std::min<int>(st.a0, v.a); st.a1 = std::max<int>(st.a1, v.a); ++st.n;
+        const GSContext &c = m_ctx[m_prim.ctxt ? 1 : 0];
+        st.fbp = c.frame.fbp; st.fbw = c.frame.fbw; st.psm = c.frame.psm; st.fbmsk = c.frame.fbmsk; st.zbp = c.zbuf.zbp; st.zpsm = c.zbuf.psm; st.zmsk = c.zbuf.zmask;
+        st.ofx = c.xyoffset.ofx; st.ofy = c.xyoffset.ofy; st.sx0 = c.scissor.x0; st.sx1 = c.scissor.x1; st.sy0 = c.scissor.y0; st.sy1 = c.scissor.y1;
+        st.ctxt = m_prim.ctxt; st.tme = m_prim.tme; st.abe = m_prim.abe; st.test = c.test; st.alpha = c.alpha;
+    }
 
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t debugIndex = s_debugGsVertexKickCount.fetch_add(1, std::memory_order_relaxed);
@@ -1573,7 +1678,24 @@ void GS::vertexKick(bool drawing)
     if (m_vtxCount < needed)
         return;
 
-    if (drawing && m_backend)
+    if (drawing)
+        ++s3_gsPrimStats[m_prim.type & 7u];
+    if (drawing && s3_drawLog)
+    {
+        const GSContext &c = m_ctx[m_prim.ctxt ? 1 : 0];
+        std::fprintf(s3_drawLog, "P t=%u ctx=%u tme=%u abe=%u fst=%u iip=%u fbp=%x zbp=%x zm=%u test=%llx alpha=%llx tex0=%x/%u/%x tw=%u th=%u tfx=%u tcc=%u ofs=%u,%u |",
+                     (unsigned)m_prim.type, (unsigned)m_prim.ctxt, (unsigned)m_prim.tme, (unsigned)m_prim.abe, (unsigned)m_prim.fst, (unsigned)m_prim.iip,
+                     c.frame.fbp, c.zbuf.zbp, (unsigned)c.zbuf.zmask, (unsigned long long)c.test, (unsigned long long)c.alpha,
+                     c.tex0.tbp0, c.tex0.tbw, (unsigned)c.tex0.psm, (unsigned)c.tex0.tw, (unsigned)c.tex0.th, (unsigned)c.tex0.tfx, (unsigned)c.tex0.tcc,
+                     c.xyoffset.ofx / 16u, c.xyoffset.ofy / 16u);
+        for (int k = 0; k < needed; ++k)
+        {
+            const GSVertex &v = m_vtxQueue[(m_vtxCount - needed + k) % kMaxVerts];
+            std::fprintf(s3_drawLog, " %.1f,%.1f,%.0f rgba=%u,%u,%u,%u st=%.3f,%.3f,%.3f uv=%u,%u", v.x, v.y, v.z, v.r, v.g, v.b, v.a, v.s, v.t, v.q, v.u, v.v);
+        }
+        std::fputc('\n', s3_drawLog);
+    }
+    if (drawing && m_backend && !s3ff::skipDraw.load(std::memory_order_relaxed))
     {
         GSPrimitiveBatch batch = buildDrawBatch(needed);
         updatePreferredDisplaySourceForDraw(batch);

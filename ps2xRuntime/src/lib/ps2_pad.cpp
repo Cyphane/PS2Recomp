@@ -1,6 +1,11 @@
+#include <cstdio>
+#include <cstdlib>
 #include "runtime/ps2_pad.h"
 #include "ps2_host_backend.h"
 #include <cstring>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace
 {
@@ -38,8 +43,12 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
 
     uint16_t btns = 0xFFFFu;
-    constexpr int kGamepad = 0;
-    const bool useGamepad = IsGamepadAvailable(kGamepad);
+    // First connected gamepad; the keyboard works alongside it.
+    int kGamepad = -1;
+    for (int i = 0; i < 4 && kGamepad < 0; ++i)
+        if (IsGamepadAvailable(i))
+            kGamepad = i;
+    const bool useGamepad = kGamepad >= 0;
     auto clearBit = [&btns](uint16_t mask)
     { btns &= ~mask; };
 
@@ -73,9 +82,12 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
             clearBit(PAD_START);
         if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_LEFT))
             clearBit(PAD_SELECT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_THUMB))
+        // s3recomp: both sticks clicked together toggle fast-forward and are not passed to the game.
+        const bool l3 = IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_THUMB);
+        const bool r3 = IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_THUMB);
+        if (l3 && !r3)
             clearBit(PAD_L3);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_THUMB))
+        if (r3 && !l3)
             clearBit(PAD_R3);
 
         float lx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_X);
@@ -87,7 +99,6 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
         data[4] = static_cast<uint8_t>(128 + rx * 127);
         data[5] = static_cast<uint8_t>(128 + ry * 127);
     }
-    else
     {
         if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
             clearBit(PAD_UP);
@@ -117,6 +128,110 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
             clearBit(PAD_START);
         if (IsKeyDown(KEY_TAB))
             clearBit(PAD_SELECT);
+    }
+
+    // s3recomp test aid: PS2X_PULSE_START=1 taps Start for a moment every few seconds.
+    {
+        static const bool pulse = [] { const char *v = std::getenv("PS2X_PULSE_START"); return v && *v == '1'; }();
+        if (pulse)
+        {
+            static uint64_t calls = 0;
+            if ((++calls % 400u) < 20u)
+                clearBit(PAD_START);
+        }
+        // PS2X_PULSE_SEQ=START,UP,CROSS,... taps the listed buttons in turn, one every 240 reads.
+        static const std::vector<uint16_t> seq = [] {
+            std::vector<uint16_t> out;
+            const char *v = std::getenv("PS2X_PULSE_SEQ");
+            if (!v)
+                return out;
+            const std::pair<const char *, uint16_t> names[] = {
+                {"UP", PAD_UP}, {"DOWN", PAD_DOWN}, {"LEFT", PAD_LEFT}, {"RIGHT", PAD_RIGHT}, {"START", PAD_START},
+                {"SELECT", PAD_SELECT}, {"CROSS", PAD_CROSS}, {"CIRCLE", PAD_CIRCLE}, {"SQUARE", PAD_SQUARE},
+                {"TRIANGLE", PAD_TRIANGLE}, {"L1", PAD_L1}, {"R1", PAD_R1}, {"L2", PAD_L2}, {"R2", PAD_R2}, {"WAIT", 0}};
+            std::string list(v);
+            size_t pos = 0;
+            while (pos <= list.size())
+            {
+                size_t end = list.find(',', pos);
+                if (end == std::string::npos)
+                    end = list.size();
+                const std::string name = list.substr(pos, end - pos);
+                for (const auto &n : names)
+                    if (name == n.first)
+                        out.push_back(n.second);
+                pos = end + 1;
+            }
+            return out;
+        }();
+        // PS2X_PAD_FILE=/path: test aid. Each line written to the file ("CROSS", "UP", ...) is
+        // pressed for ~12 reads, in order; the file is truncated once its lines are consumed.
+        {
+            static const char *padFile = std::getenv("PS2X_PAD_FILE");
+            static std::vector<uint16_t> pending;
+            static uint64_t fileCalls = 0;
+            static uint32_t holdLeft = 0, gapLeft = 0;
+            static uint16_t holdMask = 0;
+            if (padFile)
+            {
+                if ((++fileCalls % 10u) == 0u && pending.empty() && holdLeft == 0u)
+                {
+                    if (FILE *f = std::fopen(padFile, "rb"))
+                    {
+                        char buf[512] = {};
+                        const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+                        std::fclose(f);
+                        if (n > 0)
+                        {
+                            const std::pair<const char *, uint16_t> names[] = {
+                                {"UP", PAD_UP}, {"DOWN", PAD_DOWN}, {"LEFT", PAD_LEFT}, {"RIGHT", PAD_RIGHT}, {"START", PAD_START},
+                                {"SELECT", PAD_SELECT}, {"CROSS", PAD_CROSS}, {"CIRCLE", PAD_CIRCLE}, {"SQUARE", PAD_SQUARE},
+                                {"TRIANGLE", PAD_TRIANGLE}, {"L1", PAD_L1}, {"R1", PAD_R1}, {"L2", PAD_L2}, {"R2", PAD_R2}, {"WAIT", 0}};
+                            std::string all(buf, n), tok;
+                            for (char ch : all + "\n")
+                            {
+                                if (ch == '\n' || ch == '\r' || ch == ',' || ch == ' ')
+                                {
+                                    for (const auto &nm : names)
+                                        if (tok == nm.first)
+                                            pending.push_back(nm.second);
+                                    tok.clear();
+                                }
+                                else
+                                    tok += ch;
+                            }
+                            if (FILE *t = std::fopen(padFile, "wb"))
+                                std::fclose(t);
+                        }
+                    }
+                }
+                if (holdLeft > 0u)
+                {
+                    --holdLeft;
+                    if (holdMask)
+                        clearBit(holdMask);
+                    if (holdLeft == 0u)
+                        gapLeft = 12u;
+                }
+                else if (gapLeft > 0u)
+                    --gapLeft;
+                else if (!pending.empty())
+                {
+                    holdMask = pending.front();
+                    pending.erase(pending.begin());
+                    holdLeft = 12u;
+                    if (holdMask)
+                        clearBit(holdMask);
+                }
+            }
+        }
+        if (!seq.empty())
+        {
+            static uint64_t seqCalls = 0;
+            const uint64_t c = seqCalls++;
+            if ((c % 240u) < 15u)
+                clearBit(seq[(c / 240u) % seq.size()]);
+        }
     }
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);

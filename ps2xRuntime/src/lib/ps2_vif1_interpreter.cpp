@@ -295,8 +295,12 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
     processVIF1Data(m_rdram + srcPhys, sizeBytes);
 }
 
+uint64_t s3_vifStats[6] = {}; // s3recomp debug: [0]=vif1 calls [1]=bytes [2]=mscal [3]=mscnt [4]=direct [5]=unpack
+
 void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
+    ++s3_vifStats[0];
+    s3_vifStats[1] += sizeBytes;
     if (sizeBytes == 0u)
         return;
 
@@ -402,6 +406,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (opcode == VIF_MSCAL || opcode == VIF_MSCALF)
         {
+            ++s3_vifStats[2];
             uint32_t startPC = (uint32_t)imm * 8u;
 
             const uint32_t runTop = vif1_regs.tops & 0x3FFu;
@@ -422,6 +427,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (opcode == VIF_MSCNT)
         {
+            ++s3_vifStats[3];
             const uint32_t runTop = vif1_regs.tops & 0x3FFu;
             const uint32_t runItop = vif1_regs.itops & 0x3FFu;
             vif1_regs.top = runTop;
@@ -487,6 +493,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (opcode == VIF_DIRECT || opcode == VIF_DIRECTHL)
         {
+            ++s3_vifStats[4];
             uint32_t qwCount = imm;
             if (qwCount == 0)
                 qwCount = 65536;

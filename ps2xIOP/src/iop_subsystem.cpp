@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "ps2x/iop/iop_subsystem.h"
 
 #include "iop_service.h"
@@ -185,9 +186,20 @@ namespace ps2x::iop
         return RpcAbi::RuntimeDefault;
     }
 
+    namespace
+    {
+        // s3recomp: the IOP heap service (iopheap, SID 0x80000003) lives in the IOP kernel on
+        // real hardware. Games with their own copy of the EE-side library bind to it directly.
+        constexpr uint32_t kIopHeapSid = 0x80000003u;
+    }
+
     bool IopSubsystem::canBindRpc(uint32_t sid) const noexcept
     {
         if (m_impl->routes.find(sid) != m_impl->routes.end())
+        {
+            return true;
+        }
+        if (sid == kIopHeapSid)
         {
             return true;
         }
@@ -196,6 +208,30 @@ namespace ps2x::iop
 
     RpcResult IopSubsystem::handleRpc(const RpcRequest &request)
     {
+        if (request.sid == kIopHeapSid && !m_impl->emulator.hasRpcServer(kIopHeapSid))
+        {
+            uint32_t arg = 0u;
+            if (request.send.address && request.send.size >= 4u)
+                (void)m_impl->host.readGuest(request.send.address, &arg, 4u);
+            uint32_t reply = 0xFFFFFFFFu;
+            switch (request.function)
+            {
+            case 1u: // alloc(size) -> IOP address (0 on failure)
+                reply = m_impl->emulator.allocateMemory(arg ? arg : 1u, 64u);
+                break;
+            case 2u: // free(address) -> 0 / -1
+                reply = m_impl->emulator.freeMemory(arg) ? 0u : 0xFFFFFFFFu;
+                break;
+            default: // load-to-heap and anything else: not supported
+                break;
+            }
+            if (request.receive.address && request.receive.size >= 4u)
+                (void)m_impl->host.writeGuest(request.receive.address, &reply, 4u);
+            RpcResult result;
+            result.handled = true;
+            result.resultAddress = request.receive.address;
+            return result;
+        }
         const auto route = m_impl->routes.find(request.sid);
         detail::IopService *hle = route != m_impl->routes.end() ? route->second : nullptr;
 
@@ -258,6 +294,9 @@ namespace ps2x::iop
         snapshot.emulatorThreads = m_impl->emulator.threadCount();
         snapshot.emulatorRpcServers = m_impl->emulator.rpcServerCount();
         snapshot.diagnostics = m_impl->loadOutcomes;
+        static const bool s3Dump = [] { const char *v = std::getenv("PS2X_DUMP_THREADS"); return v && *v && *v != '0'; }();
+        if (s3Dump)
+            m_impl->emulator.appendThreadDebug(snapshot.diagnostics); // s3recomp: IOP thread dump
         if (!m_impl->lastError.empty())
         {
             snapshot.diagnostics.push_back(m_impl->lastError);

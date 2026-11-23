@@ -236,6 +236,7 @@ enum class EeEventType : uint8_t
     Dmac,
     ExternalWake,
     Alarm,
+    DelayedInvocation, // s3recomp: HLE completion callbacks delivered after a modelled latency
 };
 
 struct EeEvent
@@ -316,6 +317,9 @@ public:
     int setAlarm(uint16_t ticks, uint32_t handler, uint32_t argument, uint32_t gp, uint32_t sp);
     int cancelAlarm(int id);
     void queueInvocation(GuestInvocation invocation);
+    // s3recomp: queue a guest invocation to run after `microseconds` of emulated/host time,
+    // e.g. a CD completion callback, so the waiting guest thread actually blocks meanwhile.
+    void queueInvocationAfter(GuestInvocation invocation, uint64_t microseconds);
     [[noreturn]] void invokeCurrent(GuestInvocation invocation);
     [[noreturn]] void invokeCurrentSequence(std::vector<GuestInvocation> invocations);
     [[nodiscard]] bool hasInvocation(GuestInvocationKind kind, uint64_t tag) const;
@@ -405,6 +409,8 @@ private:
     std::unordered_map<int, EeSemaphore> m_semaphores;
     std::unordered_map<int, EeEventFlag> m_eventFlags;
     std::unordered_map<int, EeAlarm> m_alarms;
+    std::unordered_map<uint32_t, GuestInvocation> m_delayedInvocations;
+    uint32_t m_nextDelayedInvocation = 1;
     std::unordered_map<int, EeIrqHandler> m_intcHandlers;
     std::unordered_map<int, EeIrqHandler> m_dmacHandlers;
     int m_nextThreadId = kFirstThreadId;

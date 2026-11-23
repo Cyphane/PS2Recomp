@@ -2,12 +2,120 @@
 
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
+#include "ps2_stubs.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <chrono>
+#include <thread>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+
+// s3recomp: counted for the [perf] log line (defined in ps2_runtime.cpp).
+namespace s3perf
+{
+    extern std::atomic<uint64_t> eeSwitches;
+    extern std::atomic<uint64_t> eeIdleNs;
+}
+namespace s3ff
+{
+    extern std::atomic<bool> active;
+    uint32_t speed();
+    void onVBlank(uint64_t disp);
+    // Host time for a span of game time: shorter while fast-forward is on.
+    template <typename D>
+    std::chrono::nanoseconds hostSpan(D span)
+    {
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(span);
+        return active.load(std::memory_order_relaxed) ? ns / speed() : ns;
+    }
+}
+
+namespace s3gfx
+{
+    bool enabled();
+    void pollFromEe();
+    bool hasOutstanding();
+    uint64_t spinNs();
+}
+
+// s3recomp: the kernel snapshot only feeds diagnostics (debug panel, thread dumps, tick logs), but
+// rebuilding it on every scheduler operation costs allocations and sorts on the game thread. It is
+// republished at most every 20 ms, from accountCycles when changes are pending, and always before
+// the scheduler goes idle. One scheduler exists, driven from its executor thread.
+namespace
+{
+    bool s_snapshotDirty = false;
+    bool s_snapshotForce = false;
+    uint32_t s_snapshotPoll = 0;
+    uint64_t s_snapshotLastNs = 0;
+    constexpr uint64_t kSnapshotIntervalNs = 20000000ull;
+    uint64_t snapshotNowNs()
+    {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count());
+    }
+}
+
+// s3recomp: remember the last few dispatches so a guest thread that silently ends
+// (pc 0 or an address with no recompiled code) can be explained in the log.
+namespace
+{
+    struct S3DispatchRecord { int thread; uint32_t pc; uint32_t ra; uint32_t count; };
+    S3DispatchRecord g_s3Dispatch[64];
+    unsigned g_s3DispatchNext = 0;
+
+    void s3RecordDispatch(int thread, uint32_t pc, uint32_t ra)
+    {
+        S3DispatchRecord &last = g_s3Dispatch[(g_s3DispatchNext - 1u) & 63u];
+        if (g_s3DispatchNext && last.thread == thread && last.pc == pc && last.ra == ra)
+        {
+            ++last.count; // repeated handler runs collapse into one line
+            return;
+        }
+        g_s3Dispatch[g_s3DispatchNext++ & 63u] = {thread, pc, ra, 1u};
+    }
+
+    const uint8_t *g_s3Rdram = nullptr;
+}
+void s3ClearUnwinding() noexcept; // ps2_runtime.cpp
+namespace
+{
+
+    void s3DumpThreadEnd(const GuestThread &thread, const char *why)
+    {
+        if (thread.id < 0)
+            return; // the interrupt dispatcher context ends after every handler; that is normal
+        const R5900Context &c = thread.activeContext();
+        std::fprintf(stderr, "[thread-end] id=%d entry=0x%x %s (pc=0x%x ra=0x%x sp=0x%x) invocations=%zu\n",
+                     thread.id, thread.entry, why, c.pc, getRegU32(&c, 31), getRegU32(&c, 29), thread.invocations.size());
+        // Registers and the top of the guest stack: a return address overwritten on the stack
+        // shows up here as the same value in several frame slots.
+        for (unsigned r = 0; r < 32u; r += 8u)
+            std::fprintf(stderr, "[thread-end]   r%-2u %08x %08x %08x %08x %08x %08x %08x %08x\n", r,
+                         getRegU32(&c, r), getRegU32(&c, r + 1), getRegU32(&c, r + 2), getRegU32(&c, r + 3),
+                         getRegU32(&c, r + 4), getRegU32(&c, r + 5), getRegU32(&c, r + 6), getRegU32(&c, r + 7));
+        const uint32_t sp = getRegU32(&c, 29) & 0x01FFFFF0u;
+        if (g_s3Rdram)
+            for (uint32_t a = sp >= 0x40u ? sp - 0x40u : 0u; a < sp + 0x200u && a + 16u <= 0x02000000u; a += 16u)
+            {
+                uint32_t w[4];
+                std::memcpy(w, g_s3Rdram + a, sizeof(w));
+                std::fprintf(stderr, "[thread-end]   stack %08x: %08x %08x %08x %08x\n", a, w[0], w[1], w[2], w[3]);
+            }
+        for (unsigned i = 0; i < 64u; ++i)
+        {
+            const S3DispatchRecord &r = g_s3Dispatch[(g_s3DispatchNext + i) & 63u];
+            if (r.pc)
+                std::fprintf(stderr, "[thread-end]   recent thread=%d pc=0x%x ra=0x%x x%u\n", r.thread, r.pc, r.ra, r.count);
+        }
+    }
+}
 
 namespace
 {
@@ -82,15 +190,34 @@ EeScheduler::~EeScheduler()
     requestStop();
 }
 
+
+namespace
+{
+constexpr uint64_t kFieldTagFlag = 0x4649454C00000000ull; // 'FIEL'
+}
+
+
+static void applyInvocationField(PS2Runtime &runtime, const GuestInvocation &invocation)
+{
+    if (invocation.kind != GuestInvocationKind::Interrupt || (invocation.tag & 0xFFFFFFFF00000000ull) != kFieldTagFlag)
+        return;
+    auto &csr = runtime.memory().gs().csr;
+    if (invocation.tag & 1u)
+        csr.fetch_or(0x2000ull, std::memory_order_acq_rel);
+    else
+        csr.fetch_and(~0x2000ull, std::memory_order_acq_rel);
+}
 void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
 {
     m_executorThread = std::this_thread::get_id();
     m_rdram = rdram;
+    g_s3Rdram = rdram;
     m_readyQueues = {};
     m_threads.clear();
     m_semaphores.clear();
     m_eventFlags.clear();
     m_alarms.clear();
+    m_delayedInvocations.clear();
     m_intcHandlers.clear();
     m_dmacHandlers.clear();
     m_nextThreadId = kFirstThreadId;
@@ -172,6 +299,7 @@ void EeScheduler::run()
             {
                 copyMainContextToRuntime();
                 publishIdleDebugContext();
+                s_snapshotForce = true;
                 publishSnapshot();
                 waitForEvent();
                 continue;
@@ -185,6 +313,7 @@ void EeScheduler::run()
                 GuestThread *owner = &acquireInvocationThread();
                 GuestInvocation invocation = std::move(m_pendingInvocations.front());
                 m_pendingInvocations.pop_front();
+                applyInvocationField(m_runtime, invocation);
                 owner->status = EeThreadStatus::Running;
                 m_currentThreadId = owner->id;
                 renewTimeSlice();
@@ -246,6 +375,7 @@ void EeScheduler::run()
                 }
                 continue;
             }
+            s3DumpThreadEnd(*running, "returned to pc 0");
             makeDormant(*running);
             m_currentThreadId = 0;
             copyMainContextToRuntime();
@@ -258,6 +388,7 @@ void EeScheduler::run()
         {
             GuestInvocation invocation = std::move(m_pendingInvocations.front());
             m_pendingInvocations.pop_front();
+            applyInvocationField(m_runtime, invocation);
             if (getRegU32(&invocation.context, 29) == 0u)
             {
                 SET_GPR_U32(&invocation.context, 29, invocationStackTop());
@@ -280,12 +411,14 @@ void EeScheduler::run()
                                                 context.pc,
                                                 PS2Runtime::GuestBranchKind::DirectJump,
                                                 "EE scheduler");
+                s3DumpThreadEnd(*running, "jumped to code that was not recompiled");
                 makeDormant(*running);
                 m_currentThreadId = 0;
             }
             continue;
         }
         PS2Runtime::RecompiledFunction function = m_runtime.lookupFunction(context.pc);
+        s3RecordDispatch(running->id, context.pc, getRegU32(&context, 31));
 
         if (checkpointDue(kGuestDispatchCycles))
         {
@@ -296,6 +429,7 @@ void EeScheduler::run()
         {
             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
             m_guestExecuting.store(true, std::memory_order_release);
+            s3ClearUnwinding();
             function(m_rdram, &context, &m_runtime);
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
@@ -388,15 +522,100 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     return false;
 }
 
+// s3recomp: EE timers are advanced lazily. accountCycles runs on every guest branch, and advancing
+// the four timers each time (with 64-bit divisions and a register-map lookup) was about a tenth of
+// the game thread. Elapsed cycles collect as debt and are applied when the next timer interrupt is
+// due (so interrupts fire on the same cycle as before), before the guest reads or writes a timer
+// register or GIF_STAT, and before idling. The tick arithmetic keeps its remainder, so applying the
+// cycles in one batch gives exactly the same counts as applying them one branch at a time.
+namespace s3timers
+{
+    uint64_t g_debt = 0;
+    uint64_t g_flushAt = 0;   // debt at which the next timer interrupt is due (0: recompute)
+    uint32_t g_deferred = 0;  // interrupts raised by a flush from a register access
+    std::thread::id g_owner;  // the executor thread (the only one touching the debt)
+
+    uint32_t flush(PS2Memory &memory)
+    {
+        uint32_t mask = 0u;
+        if (g_debt != 0u)
+        {
+            mask = memory.advanceEeTimers(g_debt);
+            g_debt = 0u;
+        }
+        g_flushAt = 0u;
+        return mask;
+    }
+
+    // Called by PS2Memory before a timer register or GIF_STAT is read or written.
+    void flushForRegisterAccess(PS2Memory &memory)
+    {
+        if (std::this_thread::get_id() != g_owner)
+            return;
+        g_deferred |= flush(memory);
+    }
+}
+
 void EeScheduler::accountCycles(uint32_t cycles) noexcept
 {
     const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
     m_eeCycle += elapsed;
-    m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
-    m_runtime.advanceIopEeCycles(elapsed);
+    {
+        static const bool ownerSet = [] { s3timers::g_owner = std::this_thread::get_id(); return true; }();
+        (void)ownerSet;
+        s3timers::g_debt += elapsed;
+        if (s3timers::g_deferred != 0u)
+        {
+            m_pendingEeTimerInterrupts |= s3timers::g_deferred;
+            s3timers::g_deferred = 0u;
+        }
+        if (s3timers::g_debt >= s3timers::g_flushAt)
+        {
+            PS2Memory &memory = m_runtime.memory();
+            m_pendingEeTimerInterrupts |= s3timers::flush(memory);
+            s3timers::g_flushAt = memory.cyclesUntilNextEeTimerInterrupt();
+        }
+    }
+    {
+        // s3recomp: guest code accounts only a few cycles per branch, and running the IOP for
+        // one or two of its cycles at a time costs a full IOP scheduling pass each time. Batch
+        // EE time for the IOP (PS2X_IOP_BATCH EE cycles, default 2048: under 7 us of PS2 time).
+        static const uint64_t batch = [] {
+            const char *v = std::getenv("PS2X_IOP_BATCH");
+            const long n = v ? std::strtol(v, nullptr, 10) : 2048;
+            return static_cast<uint64_t>(n > 0 ? n : 1);
+        }();
+        static uint64_t iopDebt = 0; // accountCycles runs on the executor thread only
+        iopDebt += elapsed;
+        if (iopDebt >= batch)
+        {
+            const uint64_t run = iopDebt;
+            iopDebt = 0;
+            m_runtime.advanceIopEeCycles(run);
+        }
+    }
+    {
+        // s3recomp: with PS2X_DUMP_THREADS=1, print the IOP's threads every ~5 s of EE time.
+        // Done here on the game thread, where reading IOP state is safe.
+        static const bool dump = s3_env_flag("PS2X_DUMP_THREADS");
+        static uint64_t nextDump = 5ull * 294912000ull;
+        if (dump && m_eeCycle >= nextDump)
+        {
+            nextDump = m_eeCycle + 5ull * 294912000ull;
+            for (const std::string &line : m_runtime.iopDebugSnapshot().diagnostics)
+                if (line.rfind("[iop", 0) == 0)
+                    std::fprintf(stderr, "%s\n", line.c_str());
+        }
+    }
     if (m_pendingEeTimerInterrupts != 0u)
     {
         m_checkpointPending.store(true, std::memory_order_release);
+    }
+    if (s_snapshotDirty && (++s_snapshotPoll & 1023u) == 0u &&
+        snapshotNowNs() - s_snapshotLastNs >= kSnapshotIntervalNs)
+    {
+        s_snapshotForce = true;
+        publishSnapshot();
     }
 }
 
@@ -526,7 +745,7 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
         m_runtime.guestFree(ownedStack);
     }
     publishSnapshot();
-    throw EeDispatcherTransfer{};
+    { s3perf::eeSwitches.fetch_add(1, std::memory_order_relaxed); throw EeDispatcherTransfer{}; }
 }
 
 int EeScheduler::terminateThread(int id, uint32_t &ownedStack, bool interruptSafe)
@@ -815,13 +1034,15 @@ void EeScheduler::transferIfRequested(bool interruptSafe)
     m_rescheduleRequested = false;
     m_timeSliceExpired = false;
     publishSnapshot();
-    throw EeDispatcherTransfer{};
+    { s3perf::eeSwitches.fetch_add(1, std::memory_order_relaxed); throw EeDispatcherTransfer{}; }
 }
 
 int EeScheduler::createSemaphore(int initCount, int maxCount, uint32_t attr, uint32_t option)
 {
     assertExecutor();
-    if (maxCount <= 0 || initCount < 0 || initCount > maxCount)
+    // s3recomp: the EE kernel accepts max_count == 0 (games use it for event-style
+    // semaphores); treat it as "no upper bound" so no SignalSema is ever dropped.
+    if (maxCount < 0 || initCount < 0 || (maxCount > 0 && initCount > maxCount))
     {
         return KE_ERROR;
     }
@@ -881,7 +1102,7 @@ int EeScheduler::signalSemaphore(int id, bool interruptSafe)
         publishSnapshot();
         return id;
     }
-    if (object->count == object->maxCount)
+    if (object->maxCount > 0 && object->count >= object->maxCount)
     {
         return KE_SEMA_OVF;
     }
@@ -1076,7 +1297,7 @@ int EeScheduler::setAlarm(uint16_t ticks,
     m_alarms.emplace(id, EeAlarm{id, ticks, handler, argument, gp, sp});
     const uint64_t tickCount = ticks == 0u ? 1u : static_cast<uint64_t>(ticks);
     scheduleEvent(m_eeCycle + tickCount * kAlarmTickCycles,
-                  std::chrono::steady_clock::now() + std::chrono::microseconds(tickCount * kAlarmTickMicroseconds),
+                  std::chrono::steady_clock::now() + s3ff::hostSpan(std::chrono::microseconds(tickCount * kAlarmTickMicroseconds)),
                   EeEvent{EeEventType::Alarm, static_cast<uint32_t>(id), 0});
     return id;
 }
@@ -1096,6 +1317,23 @@ int EeScheduler::cancelAlarm(int id)
         updateNextDeadline();
     }
     return KE_OK;
+}
+
+void EeScheduler::queueInvocationAfter(GuestInvocation invocation, uint64_t microseconds)
+{
+    assertExecutor();
+    if (microseconds == 0u)
+    {
+        queueInvocation(std::move(invocation));
+        return;
+    }
+    uint32_t id = m_nextDelayedInvocation++;
+    if (id == 0u)
+        id = m_nextDelayedInvocation++;
+    m_delayedInvocations[id] = std::move(invocation);
+    scheduleEvent(m_eeCycle + microsecondsToEeCycles(microseconds),
+                  std::chrono::steady_clock::now() + s3ff::hostSpan(std::chrono::microseconds(microseconds)),
+                  EeEvent{EeEventType::DelayedInvocation, id, 0});
 }
 
 void EeScheduler::queueInvocation(GuestInvocation invocation)
@@ -1118,7 +1356,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
     invocation.sequence = ++m_invocationSequence;
     owner->invocations.push_back(std::move(invocation));
     publishSnapshot();
-    throw EeDispatcherTransfer{};
+    { s3perf::eeSwitches.fetch_add(1, std::memory_order_relaxed); throw EeDispatcherTransfer{}; }
 }
 
 [[noreturn]] void EeScheduler::invokeCurrentSequence(std::vector<GuestInvocation> invocations)
@@ -1137,7 +1375,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
         owner->invocations.push_back(std::move(*it));
     }
     publishSnapshot();
-    throw EeDispatcherTransfer{};
+    { s3perf::eeSwitches.fetch_add(1, std::memory_order_relaxed); throw EeDispatcherTransfer{}; }
 }
 
 bool EeScheduler::hasInvocation(GuestInvocationKind kind, uint64_t tag) const
@@ -1283,6 +1521,12 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
         SET_GPR_U32(&invocation.context, 28, handler.gp);
         SET_GPR_U32(&invocation.context, 29, 0u);
         SET_GPR_U32(&invocation.context, 31, 0u);
+        if (!dmac && cause == 2u)
+        {
+            // Carry this VBlank's interlace field so the handler sees it even when
+            // several VBlanks are processed before queued handlers get to run.
+            invocation.tag = kFieldTagFlag | (m_vsyncTick & 1u);
+        }
         queueInvocation(std::move(invocation));
     }
 }
@@ -1484,6 +1728,17 @@ EeKernelSnapshot EeScheduler::snapshot() const
 
 void EeScheduler::publishSnapshot()
 {
+    {
+        const uint64_t now = snapshotNowNs();
+        if (!s_snapshotForce && now - s_snapshotLastNs < kSnapshotIntervalNs)
+        {
+            s_snapshotDirty = true;
+            return;
+        }
+        s_snapshotForce = false;
+        s_snapshotDirty = false;
+        s_snapshotLastNs = now;
+    }
     EeKernelSnapshot next{};
     next.sequence = ++m_snapshotSequence;
     next.eeCycle = m_eeCycle;
@@ -1688,7 +1943,7 @@ void EeScheduler::blockCurrent(EeWaitState wait)
     self->status = self->suspendCount == 0 ? EeThreadStatus::Waiting : EeThreadStatus::WaitingSuspended;
     m_currentThreadId = 0;
     publishSnapshot();
-    throw EeDispatcherTransfer{};
+    { s3perf::eeSwitches.fetch_add(1, std::memory_order_relaxed); throw EeDispatcherTransfer{}; }
 }
 
 void EeScheduler::makeReady(GuestThread &item, int result, bool interruptSafe)
@@ -1743,6 +1998,13 @@ void EeScheduler::applyPendingPreemption()
 void EeScheduler::processPendingEvents()
 {
     assertExecutor();
+    if (s3gfx::enabled())
+    {
+        // s3recomp: graphics worker jobs that have finished complete here (D_STAT, CHCR, the
+        // DMAC handler causes), and their handlers run, as they would after a synchronous kick.
+        s3gfx::pollFromEe();
+        m_runtime.drainCompletedDmacHandlers(m_runtime.memory().getRDRAM());
+    }
     processDueDeadlines();
     const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
     m_pendingEeTimerInterrupts = 0u;
@@ -1773,6 +2035,22 @@ void EeScheduler::processPendingEvents()
     applyPendingPreemption();
 }
 
+namespace
+{
+    // s3recomp: time the game thread spends waiting in waitForEvent, for the [perf] log line.
+    struct IdleTimer
+    {
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        ~IdleTimer()
+        {
+            s3perf::eeIdleNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                 std::chrono::steady_clock::now() - start)
+                                                                 .count()),
+                                       std::memory_order_relaxed);
+        }
+    };
+}
+
 void EeScheduler::processDueDeadlines()
 {
     for (;;)
@@ -1800,6 +2078,7 @@ void EeScheduler::processDueDeadlines()
 
             if (now < pacingDeadline)
             {
+                const IdleTimer idleTimer;
                 m_eventCv.wait_until(lock, pacingDeadline, [this]()
                                      { return !m_events.empty() ||
                                               m_stopRequested.load(std::memory_order_acquire); });
@@ -1847,11 +2126,18 @@ void EeScheduler::processDueDeadlines()
         {
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
+                // s3recomp: keep at most two frames of host-time debt. Without the cap, a stretch
+                // that runs slower than real time is "won back" later by racing through vblanks,
+                // which makes movies and menus play too fast.
+                auto hostBase = scheduled.hostDeadline;
+                const auto lateLimit = std::chrono::steady_clock::now() - 2 * kVBlankPeriod;
+                if (hostBase < lateLimit)
+                    hostBase = lateLimit;
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
-                              scheduled.hostDeadline + kVBlankDuration,
+                              hostBase + s3ff::hostSpan(kVBlankDuration),
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
                 scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
-                              scheduled.hostDeadline + kVBlankPeriod,
+                              hostBase + s3ff::hostSpan(kVBlankPeriod),
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);
@@ -1867,6 +2153,10 @@ void EeScheduler::processEvent(const EeEvent &event)
         requestStop();
         break;
     case EeEventType::VBlankStart:
+    {
+        const GSRegisters &gsRegs = m_runtime.memory().gs();
+        s3ff::onVBlank(gsRegs.dispfb1 ^ (gsRegs.dispfb2 << 1) ^ (gsRegs.dispfb2 >> 63));
+    }
         ++m_vsyncTick;
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)
@@ -1910,6 +2200,18 @@ void EeScheduler::processEvent(const EeEvent &event)
         break;
     case EeEventType::Dmac:
         break;
+    case EeEventType::DelayedInvocation:
+    {
+        auto it = m_delayedInvocations.find(event.id);
+        if (it == m_delayedInvocations.end())
+        {
+            break;
+        }
+        GuestInvocation invocation = std::move(it->second);
+        m_delayedInvocations.erase(it);
+        queueInvocation(std::move(invocation));
+        break;
+    }
     case EeEventType::Alarm:
     {
         auto it = m_alarms.find(static_cast<int>(event.id));
@@ -1996,11 +2298,29 @@ void EeScheduler::writeGuestU32(uint32_t address, uint32_t value)
 
 void EeScheduler::waitForEvent()
 {
+    const IdleTimer idleTimer;
+    // s3recomp: while the graphics worker has work outstanding, its completion (which the game's
+    // DMA handler answers with the next transfer) is due any moment: spin for it instead of sleeping.
+    if (s3gfx::enabled() && s3gfx::hasOutstanding() && s3gfx::spinNs() != 0u)
+    {
+        const auto end = std::chrono::steady_clock::now() + std::chrono::nanoseconds(s3gfx::spinNs());
+        for (uint32_t n = 0; !m_checkpointPending.load(std::memory_order_acquire) && s3gfx::hasOutstanding(); ++n)
+        {
+            if ((n & 63u) == 63u)
+            {
+                if (std::chrono::steady_clock::now() >= end)
+                    break;
+                std::this_thread::yield();
+            }
+        }
+    }
     std::unique_lock lock(m_eventMutex);
     if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
     {
         return;
     }
+    m_pendingEeTimerInterrupts |= s3timers::flush(m_runtime.memory()) | s3timers::g_deferred;
+    s3timers::g_deferred = 0u;
     const uint64_t timerCycles = m_runtime.memory().cyclesUntilNextEeTimerInterrupt();
     const bool hasTimerDeadline = timerCycles != std::numeric_limits<uint64_t>::max();
     if (m_deadlines.empty() && !hasTimerDeadline)
@@ -2028,7 +2348,7 @@ void EeScheduler::waitForEvent()
     }
     if (hasTimerDeadline)
     {
-        const auto timerHostDeadline = std::chrono::steady_clock::now() + eeCyclesToHostDuration(timerCycles);
+        const auto timerHostDeadline = std::chrono::steady_clock::now() + s3ff::hostSpan(eeCyclesToHostDuration(timerCycles));
         if (timerHostDeadline < hostDeadline)
         {
             deadlineCycle = m_eeCycle + timerCycles;
