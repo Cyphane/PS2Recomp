@@ -3080,9 +3080,20 @@ void PS2Runtime::run()
                     chordDown = true;
             // The key queue also catches a tap shorter than one frame.
             bool fTapped = IsKeyPressed(KEY_F);
+            bool captureTapped = IsKeyPressed(KEY_F9);
             for (int key = GetKeyPressed(); key != 0; key = GetKeyPressed())
+            {
                 if (key == KEY_F)
                     fTapped = true;
+                if (key == KEY_F9)
+                    captureTapped = true;
+            }
+            if (captureTapped)
+            {
+                extern std::atomic<bool> s3_gsCaptureRequest; // gs_frontend.cpp
+                s3_gsCaptureRequest.store(true);
+                std::fprintf(stderr, "[gs-capture] requested (F9)\n");
+            }
             const bool toggle = fTapped || (chordDown && !s_chordWasDown);
             s_chordWasDown = chordDown;
             if (toggle)

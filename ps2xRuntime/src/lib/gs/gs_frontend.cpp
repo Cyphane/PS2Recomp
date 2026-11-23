@@ -20,6 +20,10 @@ struct S3StripStats { float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f; double
 S3StripStats s3_strip;
 FILE *s3_drawLog = nullptr;      // s3recomp debug: one-frame primitive log (PS2X_DRAW_LOG trigger file)
 uint32_t s3_drawLogFrames = 0;
+// s3recomp debug: F9 in the game window. The next frame's primitives go to logs/gs-capture-N.txt,
+// then GS memory to logs/gs-capture-N.bin (both private: they hold game graphics).
+std::atomic<bool> s3_gsCaptureRequest{false};
+namespace { int s3_gsCaptureIndex = 0; bool s3_gsCaptureOpen = false; }
 
 namespace
 {
@@ -600,6 +604,39 @@ void GS::latchHostPresentationFrame()
             std::fclose(s3_drawLog);
             s3_drawLog = nullptr;
             std::fprintf(stderr, "[gs-drawlog] closed\n");
+            if (s3_gsCaptureOpen)
+            {
+                s3_gsCaptureOpen = false;
+                std::vector<uint8_t> vram;
+                {
+                    std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+                    if (m_backend)
+                        m_backend->SnapshotVram(vram);
+                }
+                char name[64];
+                std::snprintf(name, sizeof(name), "logs/gs-capture-%d.bin", s3_gsCaptureIndex);
+                if (FILE *o = std::fopen(name, "wb"))
+                {
+                    std::fwrite(vram.data(), 1, vram.size(), o);
+                    std::fclose(o);
+                }
+                std::fprintf(stderr, "[gs-capture] %d done: GS memory in %s\n", s3_gsCaptureIndex, name);
+            }
+        }
+        if (!s3_drawLog && s3_gsCaptureRequest.exchange(false))
+        {
+            ++s3_gsCaptureIndex;
+            char name[64];
+            std::snprintf(name, sizeof(name), "logs/gs-capture-%d.txt", s3_gsCaptureIndex);
+            s3_drawLog = std::fopen(name, "w");
+            s3_drawLogFrames = 0;
+            s3_gsCaptureOpen = s3_drawLog != nullptr;
+            std::fprintf(stderr, "[gs-capture] %d: pmode=%llx smode2=%llx dispfb1=%llx display1=%llx dispfb2=%llx display2=%llx has=%d dispFbp=%x srcFbp=%x %ux%u usedPref=%d -> %s\n",
+                         s3_gsCaptureIndex, (unsigned long long)request.pmode, (unsigned long long)request.smode2,
+                         (unsigned long long)request.dispfb1, (unsigned long long)request.display1,
+                         (unsigned long long)request.dispfb2, (unsigned long long)request.display2,
+                         (int)hasFrame, displayFbp, sourceFbp, width, height, (int)usedPreferred,
+                         s3_drawLog ? name : "(could not open)");
         }
         if (drawTrigger && !s3_drawLog)
         {
@@ -1474,6 +1511,10 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             }
         }
 
+        if (s3_drawLog)
+            std::fprintf(s3_drawLog, "T dir=%u sbp=%x sbw=%u spsm=%x dbp=%x dbw=%u dpsm=%x rr=%ux%u ssa=%u,%u dsa=%u,%u\n", m_trxdir,
+                         m_bitbltbuf.sbp, m_bitbltbuf.sbw, m_bitbltbuf.spsm, m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm,
+                         m_trxreg.rrw, m_trxreg.rrh, m_trxpos.ssax, m_trxpos.ssay, m_trxpos.dsax, m_trxpos.dsay);
         if (m_backend)
         {
             GSTransferCommand command{};
@@ -1688,6 +1729,10 @@ void GS::vertexKick(bool drawing)
                      c.frame.fbp, c.zbuf.zbp, (unsigned)c.zbuf.zmask, (unsigned long long)c.test, (unsigned long long)c.alpha,
                      c.tex0.tbp0, c.tex0.tbw, (unsigned)c.tex0.psm, (unsigned)c.tex0.tw, (unsigned)c.tex0.th, (unsigned)c.tex0.tfx, (unsigned)c.tex0.tcc,
                      c.xyoffset.ofx / 16u, c.xyoffset.ofy / 16u);
+        std::fprintf(s3_drawLog, " fpsm=%u fbw=%u fbmsk=%x zpsm=%u sc=%u-%u,%u-%u tex1=%llx clamp=%llx fba=%llx fge=%u |",
+                     (unsigned)c.frame.psm, c.frame.fbw, c.frame.fbmsk, (unsigned)c.zbuf.psm,
+                     c.scissor.x0, c.scissor.x1, c.scissor.y0, c.scissor.y1,
+                     (unsigned long long)c.tex1, (unsigned long long)c.clamp, (unsigned long long)c.fba, (unsigned)m_prim.fge);
         for (int k = 0; k < needed; ++k)
         {
             const GSVertex &v = m_vtxQueue[(m_vtxCount - needed + k) % kMaxVerts];
