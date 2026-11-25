@@ -1,3 +1,4 @@
+#include <xmmintrin.h>
 #include <vector>
 #include <chrono>
 #include <atomic>
@@ -1901,7 +1902,11 @@ void VU1Fast::run(uint8_t *vuCode, uint32_t codeSize,
             if (VU1CompiledFn fn = compiledFor(vuCode, codeSize, memory, m_state.pc))
             {
                 const uint64_t before = m_cycle;
+                // s3recomp: generated code relies on denormals-are-zero (execUpperInlDaz).
+                const unsigned int savedCsr = _mm_getcsr();
+                _mm_setcsr(savedCsr | 0x0040u);
                 const int r = fn(*this, budgetEnd);
+                _mm_setcsr(savedCsr);
                 nativeCycles += m_cycle - before;
                 if (r == kGenEnded)
                 {

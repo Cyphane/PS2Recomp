@@ -349,7 +349,11 @@ namespace vu1inl
 // every written lane gives a normal result (and, for multiply-add/subtract, a normal product), where
 // the result flags are just the signs - plus exact zeros for add/subtract, whose exact result is then
 // zero too. Otherwise it changes nothing and returns false, and the exact per-lane code runs.
-VU1_FORCEINLINE bool VU1Fast::fmacSimdInl(uint32_t instr)
+// s3recomp: Daz = generated code, which runs with the MXCSR denormals-are-zero bit set (VU1Fast::run).
+// Denormal operands then act as signed zeros in hardware, exactly as normalize4 makes them, so only
+// infinities and NaNs need catching: those lanes take the exact scalar path, which normalizes them.
+template <bool Daz>
+VU1_FORCEINLINE bool VU1Fast::fmacSimdInlT(uint32_t instr)
 {
     const bool special = (instr & 0x3Cu) == 0x3Cu;
     const uint32_t code = special ? ((instr & 0x3u) | ((instr >> 4) & 0x7Cu)) : (instr & 0x3Fu);
@@ -391,11 +395,20 @@ VU1_FORCEINLINE bool VU1Fast::fmacSimdInl(uint32_t instr)
 
     const uint32_t dest = DEST(instr);
     const uint32_t moveMask = vu1inl::kRev4[dest];
-    __m128 vs = _mm_castsi128_ps(vu1inl::normalize4(_mm_loadu_si128(reinterpret_cast<const __m128i *>(m_state.vf[FS(instr)]))));
+    auto loadOperand = [](const float *p) -> __m128 {
+        const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i *>(p));
+        return _mm_castsi128_ps(Daz ? b : vu1inl::normalize4(b));
+    };
+    // lanes holding an infinity or NaN (only possible from loads); Daz code sends them to the exact path
+    auto nonFinite = [](__m128 v) -> __m128i {
+        const __m128i expMask = _mm_set1_epi32(0x7F800000);
+        return _mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(v), expMask), expMask);
+    };
+    __m128 vs = loadOperand(m_state.vf[FS(instr)]);
     __m128 right;
     if (src == kOp)
     {
-        right = _mm_castsi128_ps(vu1inl::normalize4(_mm_loadu_si128(reinterpret_cast<const __m128i *>(m_state.vf[FT(instr)]))));
+        right = loadOperand(m_state.vf[FT(instr)]);
         vs = _mm_shuffle_ps(vs, vs, _MM_SHUFFLE(3, 0, 2, 1));          // (y, z, x, w)
         right = _mm_shuffle_ps(right, right, _MM_SHUFFLE(3, 1, 0, 2)); // (z, x, y, w)
     }
@@ -405,7 +418,7 @@ VU1_FORCEINLINE bool VU1Fast::fmacSimdInl(uint32_t instr)
         right = _mm_set1_ps(normalizeOperand(m_state.i));
     else
     {
-        right = _mm_castsi128_ps(vu1inl::normalize4(_mm_loadu_si128(reinterpret_cast<const __m128i *>(m_state.vf[FT(instr)]))));
+        right = loadOperand(m_state.vf[FT(instr)]);
         if (src == kBc)
         {
             switch (instr & 3u)
@@ -418,6 +431,7 @@ VU1_FORCEINLINE bool VU1Fast::fmacSimdInl(uint32_t instr)
         }
     }
 
+    __m128i unusualOperands = Daz ? _mm_or_si128(nonFinite(vs), nonFinite(right)) : _mm_setzero_si128();
     __m128 result;
     __m128i unusual;
     uint32_t extraSticky = 0u;
@@ -450,7 +464,9 @@ VU1_FORCEINLINE bool VU1Fast::fmacSimdInl(uint32_t instr)
         {
             // acc +- product is an exact zero when both are exact zeros; any other zero result, which
             // may be a rounded product cancelling acc, takes the exact path.
-            const __m128 acc = _mm_castsi128_ps(vu1inl::normalize4(_mm_loadu_si128(reinterpret_cast<const __m128i *>(m_state.acc))));
+            const __m128 acc = loadOperand(m_state.acc);
+            if (Daz)
+                unusualOperands = _mm_or_si128(unusualOperands, nonFinite(acc));
             result = kind == kMadd ? _mm_add_ps(acc, product) : _mm_sub_ps(acc, product);
             const __m128i resultZero = _mm_and_si128(productZero, _mm_castps_si128(_mm_cmpeq_ps(acc, _mm_setzero_ps())));
             unusual = _mm_or_si128(_mm_andnot_si128(resultZero, vu1inl::unusual4(_mm_castps_si128(result))), productUnusual);
@@ -459,6 +475,8 @@ VU1_FORCEINLINE bool VU1Fast::fmacSimdInl(uint32_t instr)
             extraSticky = ((static_cast<uint32_t>(_mm_movemask_ps(product)) & moveMask) ? 0x2u : 0u) | (productZeros ? 0x1u : 0u);
         }
     }
+    if (Daz)
+        unusual = _mm_or_si128(unusual, unusualOperands);
     if (static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(unusual))) & moveMask)
         return false;
 
@@ -578,7 +596,8 @@ VU1_FORCEINLINE bool VU1Fast::miscSimdInl(uint32_t instr)
     return false;
 }
 #else
-VU1_FORCEINLINE bool VU1Fast::fmacSimdInl(uint32_t)
+template <bool Daz>
+VU1_FORCEINLINE bool VU1Fast::fmacSimdInlT(uint32_t)
 {
     return false;
 }
@@ -591,11 +610,28 @@ VU1_FORCEINLINE bool VU1Fast::miscSimdInl(uint32_t)
 // Generated programs inline only the four-lane FMAC fast path; everything else (other upper
 // instructions, and FMAC results that need the exact path) is one shared out-of-line copy, which
 // keeps the generated code small enough for the instruction cache.
+VU1_FORCEINLINE bool VU1Fast::fmacSimdInl(uint32_t instr)
+{
+    return fmacSimdInlT<false>(instr);
+}
+
 VU1_FORCEINLINE void VU1Fast::execUpperInl(uint32_t instr)
 {
     if (fmacSimdInl(instr) || miscSimdInl(instr))
         return;
     execUpperScalar(instr);
+}
+
+// s3recomp: for generated code only (it runs with denormals-are-zero set, see fmacSimdInlT).
+VU1_FORCEINLINE void VU1Fast::execUpperInlDaz(uint32_t instr)
+{
+    if (fmacSimdInlT<true>(instr) || miscSimdInl(instr))
+        return;
+    // The exact path (unusual results and operands) runs without denormals-are-zero, as everywhere else.
+    const unsigned int csr = _mm_getcsr();
+    _mm_setcsr(csr & ~0x0040u);
+    execUpperScalar(instr);
+    _mm_setcsr(csr);
 }
 
 VU1_FORCEINLINE void VU1Fast::execUpperScalarInl(uint32_t instr)

@@ -390,20 +390,20 @@ static void emitPair(std::string &o, VU1Fast &dec, const Program &p, uint32_t A,
     const bool lowerNop = d.lower == 0u || d.lower == 0x8000033Cu;
     if (d.iBit)
     {
-        if (!upperNop) emit(o, "    v.execUpperInl(0x%08Xu);\n", d.upper);
+        if (!upperNop) emit(o, "    v.execUpperInlDaz(0x%08Xu);\n", d.upper);
         emit(o, "    { uint32_t b = 0x%08Xu; float f; std::memcpy(&f, &b, 4); v.m_state.i = v.normalizeOperand(f); }\n", d.lower);
     }
     else if (d.upperVfShadowReg)
     {
-        emit(o, "    { float oldVf[4], upperVf[4]; std::memcpy(oldVf, v.m_state.vf[%u], 16); v.execUpperInl(0x%08Xu); std::memcpy(upperVf, v.m_state.vf[%u], 16); std::memcpy(v.m_state.vf[%u], oldVf, 16);\n",
+        emit(o, "    { float oldVf[4], upperVf[4]; std::memcpy(oldVf, v.m_state.vf[%u], 16); v.execUpperInlDaz(0x%08Xu); std::memcpy(upperVf, v.m_state.vf[%u], 16); std::memcpy(v.m_state.vf[%u], oldVf, 16);\n",
                      d.upperVfShadowReg, d.upper, d.upperVfShadowReg, d.upperVfShadowReg);
         emit(o, "      v.execLowerInl(0x%08Xu, v.m_activeVuData, v.m_activeVuDataSize, *v.m_activeGs, v.m_activeMemory, 0x%08Xu); std::memcpy(v.m_state.vf[%u], upperVf, 16); }\n",
                      d.lower, d.upper, d.upperVfShadowReg);
     }
     else
     {
-        if (!upperNop && macDead) emit(o, "    v.m_skipMac = true; v.execUpperInl(0x%08Xu); v.m_skipMac = false;\n", d.upper);
-        else if (!upperNop) emit(o, "    v.execUpperInl(0x%08Xu);\n", d.upper);
+        if (!upperNop && macDead) emit(o, "    v.m_skipMac = true; v.execUpperInlDaz(0x%08Xu); v.m_skipMac = false;\n", d.upper);
+        else if (!upperNop) emit(o, "    v.execUpperInlDaz(0x%08Xu);\n", d.upper);
         if (!lowerNop) emit(o, "    v.execLowerInl(0x%08Xu, v.m_activeVuData, v.m_activeVuDataSize, *v.m_activeGs, v.m_activeMemory, 0x%08Xu);\n", d.lower, d.upper);
     }
     emit(o, "    v.m_viBranchBackupValid = false;\n");
@@ -441,6 +441,200 @@ static void emitPair(std::string &o, VU1Fast &dec, const Program &p, uint32_t A,
     emit(o, "    if (v.pairEnd<%s, %s, %s, %s>(0x%Xu) == kGenEnded) return kGenEnded;\n", d.eBit ? "true" : "false", d.dBit ? "true" : "false",
                  d.tBit ? "true" : "false", isBranch ? "true" : "false", next);
     emit(o, "    if (v.m_state.pc != 0x%Xu) return kGenNext;\n  }\n", next);
+}
+
+
+// s3recomp: lean blocks. When a block is entered with nothing pending from earlier code that could
+// make any of its pairs stall (checked once at entry), every stall inside it is known when the code is
+// generated: they come only from the block's own writes. Such a block then needs no per-pair budget,
+// stop, readiness or pc/cycle bookkeeping. Each pair still advances m_cycle and commits what is due,
+// so flags, Q and stores happen at exactly the same cycles as in the exact block. The entry check
+// falls back to the exact block (emitted as <name>_x) whenever its assumptions do not hold.
+static bool g_leanBlocks = true;
+static int g_leanCount = 0, g_blockCount = 0;
+
+static void emitPairExec(std::string &o, const VU1Fast::DecodedInstructionPair &d, bool macDead)
+{
+    const bool upperNop = isUpperNop(d.upper);
+    const bool lowerNop = d.lower == 0u || d.lower == 0x8000033Cu;
+    if (d.iBit)
+    {
+        if (!upperNop) emit(o, macDead ? "    v.m_skipMac = true; v.execUpperInlDaz(0x%08Xu); v.m_skipMac = false;\n" : "    v.execUpperInlDaz(0x%08Xu);\n", d.upper);
+        emit(o, "    { uint32_t b = 0x%08Xu; float f; std::memcpy(&f, &b, 4); v.m_state.i = v.normalizeOperand(f); }\n", d.lower);
+    }
+    else if (d.upperVfShadowReg)
+    {
+        emit(o, "    { float oldVf[4], upperVf[4]; std::memcpy(oldVf, v.m_state.vf[%u], 16); v.execUpperInlDaz(0x%08Xu); std::memcpy(upperVf, v.m_state.vf[%u], 16); std::memcpy(v.m_state.vf[%u], oldVf, 16);\n",
+             d.upperVfShadowReg, d.upper, d.upperVfShadowReg, d.upperVfShadowReg);
+        emit(o, "      v.execLowerInl(0x%08Xu, v.m_activeVuData, v.m_activeVuDataSize, *v.m_activeGs, v.m_activeMemory, 0x%08Xu); std::memcpy(v.m_state.vf[%u], upperVf, 16); }\n",
+             d.lower, d.upper, d.upperVfShadowReg);
+    }
+    else
+    {
+        if (!upperNop && macDead) emit(o, "    v.m_skipMac = true; v.execUpperInlDaz(0x%08Xu); v.m_skipMac = false;\n", d.upper);
+        else if (!upperNop) emit(o, "    v.execUpperInlDaz(0x%08Xu);\n", d.upper);
+        if (!lowerNop) emit(o, "    v.execLowerInl(0x%08Xu, v.m_activeVuData, v.m_activeVuDataSize, *v.m_activeGs, v.m_activeMemory, 0x%08Xu);\n", d.lower, d.upper);
+    }
+}
+
+// Returns false (emitting nothing) when the block cannot be lean.
+static bool emitLeanBlock(std::string &o, VU1Fast &dec, const Program &p, uint32_t start, uint32_t stop,
+                          const std::vector<bool> &deadAll, const std::string &name, const std::string &exactName)
+{
+    const uint32_t n = (stop - start) / 8u;
+    std::vector<VU1Fast::DecodedInstructionPair> d(n);
+    for (uint32_t k = 0; k < n; ++k)
+    {
+        d[k] = dec.decodeInstructionPair(p.code.data() - p.addr, start + k * 8u);
+        const auto &x = d[k];
+        if (x.upperUsage.reserved || x.lowerUsage.reserved)
+            return false;
+        if (!x.iBit && (x.lowerUsage.pipeline == VU1Fast::PipelineEfu || x.lowerUsage.waitP ||
+                        x.lowerUsage.pipeline == VU1Fast::PipelineXgkick))
+            return false;
+        if (x.upperUsage.pipeline == VU1Fast::PipelineEfu || x.upperUsage.pipeline == VU1Fast::PipelineXgkick)
+            return false;
+    }
+    // Static issue cycles, relative to the block's entry cycle, mirroring calculatePairReadyCycle.
+    std::vector<int> issue(n);
+    int lastVf[32][4], latVf[32][4], lastVi[16], latVi[16];
+    for (auto &r : lastVf) for (int &x : r) x = -1;
+    for (int &x : lastVi) x = -1;
+    int lastFdiv = -1, latFdiv = 0;
+    std::map<std::pair<int, int>, int> vfGuard; // (reg, lane) -> earliest issue that reads it before any block write
+    std::map<int, int> viGuard;
+    int fdivGuard = -1;
+    for (uint32_t k = 0; k < n; ++k)
+    {
+        const auto &x = d[k];
+        int ready = k == 0 ? 0 : issue[k - 1] + 1;
+        std::vector<std::pair<int, int>> preVf;
+        std::vector<int> preVi;
+        for (uint32_t r = 0; r < x.readCount; ++r)
+            for (int l = 0; l < 4; ++l)
+                if (x.readLanes[r] & (8u >> l))
+                {
+                    const int reg = x.readReg[r] & 31;
+                    if (lastVf[reg][l] >= 0) ready = std::max(ready, issue[lastVf[reg][l]] + latVf[reg][l]);
+                    else preVf.push_back({reg, l});
+                }
+        for (uint32_t bits = x.viReadMask; bits; bits &= bits - 1)
+        {
+            const int r = __builtin_ctz(bits) & 15;
+            if (lastVi[r] >= 0) ready = std::max(ready, issue[lastVi[r]] + latVi[r]);
+            else preVi.push_back(r);
+        }
+        const bool usesFdiv = !x.iBit && (x.lowerUsage.pipeline == VU1Fast::PipelineFdiv || x.lowerUsage.waitQ);
+        bool preFdiv = false;
+        if (usesFdiv)
+        {
+            if (lastFdiv >= 0) ready = std::max(ready, issue[lastFdiv] + latFdiv);
+            else preFdiv = true;
+        }
+        issue[k] = ready;
+        // Readiness of earlier code: a write issued before the block (at entry - 1 at the latest) is
+        // ready by entry - 1 + its latency, so only early reads need checking.
+        for (auto &pr : preVf)
+            if (issue[k] < g_maxLatency.vf && !vfGuard.count(pr)) vfGuard[pr] = issue[k];
+        for (int r : preVi)
+            if (issue[k] < g_maxLatency.vi && !viGuard.count(r)) viGuard[r] = issue[k];
+        if (preFdiv && fdivGuard < 0) fdivGuard = issue[k];
+        // Writes (after this pair's reads).
+        for (uint32_t w = 0; w < x.writeCount; ++w)
+            for (int l = 0; l < 4; ++l)
+                if (x.writeLanes[w] & (8u >> l))
+                {
+                    lastVf[x.writeReg[w] & 31][l] = int(k);
+                    latVf[x.writeReg[w] & 31][l] = x.writeLatency[w];
+                }
+        for (uint32_t bits = x.viWriteMask; bits; bits &= bits - 1)
+        {
+            lastVi[__builtin_ctz(bits) & 15] = int(k);
+            latVi[__builtin_ctz(bits) & 15] = x.viWriteLatency;
+        }
+        if (!x.iBit && x.lowerUsage.pipeline == VU1Fast::PipelineFdiv && !x.lowerUsage.waitQ)
+        {
+            lastFdiv = int(k);
+            latFdiv = x.lowerUsage.latency;
+        }
+    }
+    const int total = issue[n - 1] + 1;
+    // Exact block first (same body as before, under another name), then the lean entry.
+    std::string cond;
+    for (auto &[rl, at] : vfGuard)
+        cond += " && v.m_vfReady[" + std::to_string(rl.first) + "][" + std::to_string(rl.second) + "] <= b + " + std::to_string(at) + "u";
+    for (auto &[r, at] : viGuard)
+        cond += " && v.m_viReady[" + std::to_string(r) + "] <= b + " + std::to_string(at) + "u";
+    if (fdivGuard >= 0)
+        cond += " && (!v.m_fdiv.valid || v.m_fdiv.readyCycle <= b + " + std::to_string(fdivGuard) + "u)";
+    emit(o, "int %s(VU1Fast &v, uint64_t budgetEnd)\n{\n", name.c_str());
+    emit(o, "  const uint64_t b = v.m_cycle;\n");
+    emit(o, "  if (!(b + %du <= budgetEnd && !v.m_stopRequested && !v.m_xgkick.active%s))\n    return %s(v, budgetEnd);\n", total, cond.c_str(), exactName.c_str());
+    emit(o, "  v.commitIfDue();\n");
+    // last writer of each (reg, lane) / vi in the block: its readiness is stored for later blocks
+    std::vector<std::vector<std::pair<int, int>>> storeVf(n);
+    std::vector<std::vector<int>> storeVi(n);
+    for (int r = 0; r < 32; ++r)
+        for (int l = 0; l < 4; ++l)
+            if (lastVf[r][l] >= 0) storeVf[lastVf[r][l]].push_back({r, l});
+    for (int r = 0; r < 16; ++r)
+        if (lastVi[r] >= 0) storeVi[lastVi[r]].push_back(r);
+    bool prevRecorded = false;
+    bool lastPlain = false;
+    for (uint32_t k = 0; k < n; ++k)
+    {
+        const auto &x = d[k];
+        const uint32_t A = start + k * 8u;
+        const uint32_t next = (A + 8u) & 0x3FFFu;
+        const bool ctrl = pairIsControl(x);
+        // like emitPair: the pair before a block's first pair may be its branch (blocks are capped in
+        // length, so a delay slot can start a block)
+        const bool prevCtrl = k > 0 ? pairIsControl(d[k - 1])
+                                    : pairIsControl(dec.decodeInstructionPair(p.code.data() - p.addr, (A - 8u) & 0x3FFFu));
+        emit(o, "  { // 0x%04X%s\n", A, ctrl ? " control" : "");
+        if (k > 0 && issue[k] > issue[k - 1] + 1)
+            emit(o, "    v.advanceTo(b + %du);\n", issue[k]);
+        if (ctrl && !prevCtrl)
+            emit(o, "    v.m_state.pc = 0x%Xu;\n", A);
+        const uint8_t writtenVi = x.viWriteMask ? static_cast<uint8_t>(__builtin_ctz(x.viWriteMask)) : 0u;
+        const bool records = writtenVi && x.lowerUsage.delaysNextBranchRead;
+        if (records)
+            emit(o, "    const int32_t oldVi = v.m_state.vi[%u];\n", writtenVi);
+        emitPairExec(o, x, deadAll[(A - p.addr) / 8u]);
+        if (k == 0 || prevRecorded)
+            emit(o, "    v.m_viBranchBackupValid = false;\n");
+        if (writtenVi)
+            emit(o, "    v.m_state.vi[%u] = static_cast<int16_t>(v.m_state.vi[%u]);\n", writtenVi, writtenVi);
+        for (auto &[r, l] : storeVf[k])
+        {
+            int lat = 0;
+            for (uint32_t w = 0; w < x.writeCount; ++w)
+                if ((x.writeReg[w] & 31) == r && (x.writeLanes[w] & (8u >> l))) lat = x.writeLatency[w];
+            emit(o, "    v.m_vfReady[%d][%d] = b + %du;\n", r, l, issue[k] + lat);
+        }
+        for (int r : storeVi[k])
+            emit(o, "    v.m_viReady[%d] = b + %du;\n", r, issue[k] + x.viWriteLatency);
+        if (records)
+            emit(o, "    v.recordViWriteForBranch(%u, oldVi);\n", writtenVi);
+        prevRecorded = records;
+        if (!ctrl && !prevCtrl)
+        {
+            emit(o, g_programWritesZeroRegs ? "    v.resetZeroRegs();\n    ++v.m_cycle;\n    v.commitIfDue();\n  }\n" : "    ++v.m_cycle;\n    v.commitIfDue();\n  }\n");
+            lastPlain = true;
+        }
+        else
+        {
+            const bool isBranch = !x.iBit && x.lowerUsage.pipeline == VU1Fast::PipelineBranch;
+            emit(o, "    if (v.pairEnd<%s, %s, %s, %s>(0x%Xu) == kGenEnded) return kGenEnded;\n", x.eBit ? "true" : "false", x.dBit ? "true" : "false",
+                 x.tBit ? "true" : "false", isBranch ? "true" : "false", next);
+            emit(o, "    if (v.m_state.pc != 0x%Xu) return kGenNext;\n  }\n", next);
+            lastPlain = false;
+        }
+    }
+    if (lastPlain)
+        emit(o, "  v.m_state.pc = 0x%Xu;\n  v.m_state.cycles = v.m_cycle;\n", stop & 0x3FFFu);
+    emit(o, "  return kGenNext;\n}\n\n");
+    return true;
 }
 
 // Addresses where generated blocks start: program start, branch targets, and the pairs after a
@@ -491,6 +685,8 @@ int main(int argc, char **argv)
         const std::string arg = argv[a];
         if (arg == "--out" && a + 1 < argc)
             outDir = argv[++a];
+        else if (arg == "--no-lean")
+            g_leanBlocks = false;
         else if (arg == "--tag" && a + 1 < argc)
             tag = argv[++a];
         else
@@ -592,7 +788,14 @@ int main(int argc, char **argv)
                 emit(o, "// VU1 program %d\n#include \"ps2_vu1_fast_inl.h\"\n#include <algorithm>\n#include <cstring>\n\n", idx);
                 pairsInPart = 0;
             }
-            emit(o, "int %s%04X(VU1Fast &v, uint64_t budgetEnd)\n{\n", prefix.c_str(), start);
+            char nameBuf[64];
+            std::snprintf(nameBuf, sizeof(nameBuf), "%s%04X", prefix.c_str(), start);
+            const std::string blockName = nameBuf;
+            std::string lean;
+            const bool isLean = g_leanBlocks && emitLeanBlock(lean, dec, p, start, stop, deadAll, blockName, blockName + "_x");
+            ++g_blockCount;
+            g_leanCount += isLean ? 1 : 0;
+            emit(o, "%sint %s%s(VU1Fast &v, uint64_t budgetEnd)\n{\n", isLean ? "static " : "", blockName.c_str(), isLean ? "_x" : "");
             BlockTiming timing;
             beginBlockTiming(timing);
             for (uint32_t A = start; A < stop; A += 8)
@@ -603,6 +806,7 @@ int main(int argc, char **argv)
                 deadMacPairs += dead ? 1 : 0;
             }
             emit(o, "    return kGenNext;\n}\n\n");
+            o += lean;
             pairsInPart += (stop - start) / 8u;
         }
         flushPart();
@@ -656,6 +860,6 @@ int main(int argc, char **argv)
     size_t pairs = 0;
     for (auto &[key, p] : uniq)
         pairs += p.code.size() / 8;
-    std::printf("ps2_vu1gen: %d VU1 programs (%zu instruction pairs; %d without status reads, %zu dead MAC results) in %zu source files\n", idx, pairs, eagerPrograms, deadMacPairs, written.size());
+    std::printf("ps2_vu1gen: %d VU1 programs (%zu instruction pairs; %d without status reads, %zu dead MAC results; %d of %d blocks lean) in %zu source files\n", idx, pairs, eagerPrograms, deadMacPairs, g_leanCount, g_blockCount, written.size());
     return 0;
 }

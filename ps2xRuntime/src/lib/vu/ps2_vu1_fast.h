@@ -454,6 +454,7 @@ public: // generated VU1 code accesses the core directly
 
     void execUpper(uint32_t instr);
     void execUpperInl(uint32_t instr); // defined in ps2_vu1_fast_upper_inl.h
+    void execUpperInlDaz(uint32_t instr); // generated code (runs with MXCSR DAZ set)
     void execUpperScalarInl(uint32_t instr); // the same, without the four-lane FMAC fast path
     void execUpperScalar(uint32_t instr);    // out-of-line execUpperScalarInl
     void execLowerInl(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr); // ps2_vu1_fast_lower_inl.h
@@ -480,6 +481,8 @@ public: // generated VU1 code accesses the core directly
     void applyFmacDestInl(uint32_t upper, float *dst, float *result, uint8_t dest);
     bool fmacExactInl(uint32_t upper, uint32_t component, double &result) const;
     bool fmacSimdInl(uint32_t instr); // four-lane fast path (ps2_vu1_fast_upper_inl.h)
+    template <bool Daz>
+    bool fmacSimdInlT(uint32_t instr);
     bool miscSimdInl(uint32_t instr); // four-lane MAX/MINI/ITOF/FTOI/ABS/CLIP
     void queueFsset(uint16_t immediate);
     void queueClip(uint32_t clip);
