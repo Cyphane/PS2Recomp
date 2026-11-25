@@ -2,6 +2,8 @@
 // (or overlay) and writes them out as C++ that runs on VU1Fast. Each instruction pair becomes
 // straight-line code with its timing bookkeeping resolved at generation time.
 #define private public
+#include <functional>
+#include <map>
 #include "ps2_vu1_fast.h"
 #undef private
 #include <cstdio>
@@ -244,6 +246,106 @@ static std::vector<bool> deadMacResults(VU1Fast &dec, const Program &p, uint32_t
     return dead;
 }
 
+// s3recomp: program-wide version of deadMacResults. A MAC result written at pair i is dead when, on
+// every path from i, another FMAC writes MAC before any MAC read and no read follows within three
+// pairs of that write (reads there might still see i's result), and the program does not end or
+// leave (JR/JALR, falling off the end) before that. Paths follow the VU1's delay slots: the pair
+// after a branch or E/D/T pair executes, then control goes to the target(s) or ends.
+static std::vector<bool> deadMacProgram(VU1Fast &dec, const Program &p, const std::set<uint32_t> &leaders)
+{
+    const uint32_t n = uint32_t(p.code.size() / 8u);
+    const uint32_t base = p.addr;
+    std::vector<VU1Fast::DecodedInstructionPair> d(n);
+    std::vector<bool> writes(n), reads(n);
+    for (uint32_t k = 0; k < n; ++k)
+    {
+        d[k] = dec.decodeInstructionPair(p.code.data() - p.addr, base + k * 8u);
+        writes[k] = !d[k].upperUsage.reserved && !d[k].iBit && upperWritesMac(d[k].upper);
+        reads[k] = d[k].upperUsage.reserved || d[k].lowerUsage.reserved || lowerReadsMac(d[k]);
+    }
+    constexpr int kEnd = -1, kUnknown = -2;
+    // successors of pair k (as pair indices, or kEnd / kUnknown)
+    auto controlSuccs = [&](uint32_t c, std::vector<int> &out) {
+        // c is a control pair; this gives where control goes after its delay slot c+1
+        const auto &dc = d[c];
+        if (dc.eBit) { out.push_back(kEnd); return; }
+        bool fall = dc.dBit || dc.tBit; // a halt that may not trigger
+        if (dc.dBit || dc.tBit) out.push_back(kEnd);
+        if (!dc.iBit && dc.lowerUsage.pipeline == VU1Fast::PipelineBranch)
+        {
+            const uint32_t op = dc.lower >> 25;
+            if (op == 0x24u || op == 0x25u) { out.push_back(kUnknown); return; } // JR / JALR
+            const int32_t imm = static_cast<int32_t>(dc.lower << 21) >> 21;
+            const uint32_t target = (base + c * 8u + 8u + uint32_t(imm * 8)) & 0x3FFFu;
+            if (target >= base && target < base + n * 8u) out.push_back(int((target - base) / 8u));
+            else out.push_back(kUnknown);
+            const bool unconditional = op == 0x20u || op == 0x21u; // B / BAL
+            if (!unconditional) fall = true;
+        }
+        if (fall) out.push_back(c + 2u < n ? int(c + 2u) : kUnknown);
+    };
+    std::vector<std::vector<int>> succ(n);
+    for (uint32_t k = 0; k < n; ++k)
+    {
+        const bool prevControl = k > 0 && pairIsControl(d[k - 1]);
+        if (prevControl)
+        {
+            controlSuccs(k - 1, succ[k]);
+            if (leaders.count(base + k * 8u)) // reachable without its control pair too
+                succ[k].push_back(k + 1u < n ? int(k + 1u) : kUnknown);
+        }
+        else
+            succ[k].push_back(k + 1u < n ? int(k + 1u) : kUnknown);
+    }
+    // g(k, w): no MAC read in the next w pairs from k on any path (an end is fine: the pipeline then
+    // flushes in order, so the later write wins).
+    std::map<std::pair<int, int>, bool> gMemo;
+    std::function<bool(int, int)> g = [&](int k, int w) -> bool {
+        if (w == 0 || k == kEnd) return true;
+        if (k == kUnknown) return false;
+        auto key = std::make_pair(k, w);
+        auto it = gMemo.find(key);
+        if (it != gMemo.end()) return it->second;
+        bool ok = !reads[k];
+        for (size_t s = 0; ok && s < succ[k].size(); ++s) ok = g(succ[k][s], w - 1);
+        gMemo[key] = ok;
+        return ok;
+    };
+    // f(k): from k, on every path a MAC write comes before any read (and g holds after it), without
+    // ending or leaving first. Computed as a greatest fixed point without recursion: start with every
+    // pair that is not a read as true and clear pairs whose condition fails until nothing changes
+    // (a cycle with no reads keeps the old value unread, so it stays true).
+    std::vector<int8_t> fState(n);
+    for (uint32_t k = 0; k < n; ++k)
+        fState[k] = reads[k] ? 3 : 2;
+    for (bool changed = true; changed;)
+    {
+        changed = false;
+        for (uint32_t k = 0; k < n; ++k)
+        {
+            if (fState[k] != 2)
+                continue;
+            bool ok = true;
+            if (writes[k])
+                for (int s : succ[k]) ok = ok && g(s, 3);
+            else
+                for (int s : succ[k]) ok = ok && s >= 0 && fState[s] == 2;
+            if (!ok) { fState[k] = 3; changed = true; }
+        }
+    }
+    std::vector<bool> dead(n, false);
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        if (!writes[i]) continue;
+        bool ok = true;
+        for (int s : succ[i]) ok = ok && s >= 0 && fState[s] == 2;
+        dead[i] = ok;
+    }
+    return dead;
+}
+
+static bool g_programWritesZeroRegs = true; // s3recomp: per program, set before its blocks are emitted
+
 static void emitPair(std::string &o, VU1Fast &dec, const Program &p, uint32_t A, BlockTiming &timing, int pairIndex, bool macDead)
 {
     const auto d = dec.decodeInstructionPair(p.code.data() - p.addr, A);
@@ -256,7 +358,10 @@ static void emitPair(std::string &o, VU1Fast &dec, const Program &p, uint32_t A,
         emit(o, "    return kGenFallback;\n  }\n");
         return;
     }
-    emit(o, "    v.commitIfDue();\n");
+    // s3recomp: the previous pair in the block ended with stepCycle(), which already committed what
+    // was due at this cycle, so only a block's first pair needs the check.
+    if (pairIndex == 0)
+        emit(o, "    v.commitIfDue();\n");
     std::string ready;
     for (uint32_t k = 0; k < d.readCount; ++k)
         for (int l = 0; l < 4; ++l)
@@ -329,7 +434,8 @@ static void emitPair(std::string &o, VU1Fast &dec, const Program &p, uint32_t A,
     const bool isBranch = d.lowerUsage.pipeline == VU1Fast::PipelineBranch;
     if (plainEnd)
     {
-        emit(o, "    v.pairEndPlain(0x%Xu);\n  }\n", next);
+        // s3recomp: a program that never writes VF0/VI0 cannot dirty them, so the per-pair reset is skipped.
+        emit(o, g_programWritesZeroRegs ? "    v.pairEndPlain(0x%Xu);\n  }\n" : "    v.pairEndPlainNoZero(0x%Xu);\n  }\n", next);
         return;
     }
     emit(o, "    if (v.pairEnd<%s, %s, %s, %s>(0x%Xu) == kGenEnded) return kGenEnded;\n", d.eBit ? "true" : "false", d.dBit ? "true" : "false",
@@ -445,6 +551,17 @@ int main(int argc, char **argv)
     {
         const uint64_t h = vu1RegionHash(p.code.data(), uint32_t(p.code.size()));
         const std::set<uint32_t> leaders = findLeaders(dec, p);
+        const std::vector<bool> deadAll = deadMacProgram(dec, p, leaders);
+        g_programWritesZeroRegs = false;
+        for (uint32_t A = p.addr; A < p.addr + uint32_t(p.code.size()); A += 8)
+        {
+            const auto d = dec.decodeInstructionPair(p.code.data() - p.addr, A);
+            if (d.upperUsage.reserved || d.lowerUsage.reserved || (d.viWriteMask & 1u))
+                g_programWritesZeroRegs = true;
+            for (uint32_t k = 0; k < d.writeCount; ++k)
+                if ((d.writeReg[k] & 31u) == 0u)
+                    g_programWritesZeroRegs = true;
+        }
         const uint32_t end = p.addr + uint32_t(p.code.size());
         const std::string prefix = "vu1p" + std::to_string(idx) + "_b";
         // Blocks are spread over several source files of at most kPairsPerFile pairs each, so
@@ -478,12 +595,12 @@ int main(int argc, char **argv)
             emit(o, "int %s%04X(VU1Fast &v, uint64_t budgetEnd)\n{\n", prefix.c_str(), start);
             BlockTiming timing;
             beginBlockTiming(timing);
-            const std::vector<bool> dead = deadMacResults(dec, p, start, stop);
             for (uint32_t A = start; A < stop; A += 8)
             {
                 const uint32_t k = (A - start) / 8u;
-                emitPair(o, dec, p, A, timing, static_cast<int>(k), dead[k]);
-                deadMacPairs += dead[k] ? 1 : 0;
+                const bool dead = deadAll[(A - p.addr) / 8u];
+                emitPair(o, dec, p, A, timing, static_cast<int>(k), dead);
+                deadMacPairs += dead ? 1 : 0;
             }
             emit(o, "    return kGenNext;\n}\n\n");
             pairsInPart += (stop - start) / 8u;

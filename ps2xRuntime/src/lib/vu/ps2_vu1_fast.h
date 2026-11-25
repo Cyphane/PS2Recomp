@@ -333,6 +333,12 @@ public: // generated VU1 code accesses the core directly
         m_state.pc = next;
         stepCycle();
     }
+    // s3recomp: the same for programs that never write VF0 or VI0 (they stay 0 / (0,0,0,1)).
+    VU1_HOT_INLINE void pairEndPlainNoZero(uint32_t next)
+    {
+        m_state.pc = next;
+        stepCycle();
+    }
     const uint8_t *m_activeVuCode = nullptr;
     uint32_t m_activeVuCodeSize = 0;
     int stepPair(uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint64_t budgetEnd);
