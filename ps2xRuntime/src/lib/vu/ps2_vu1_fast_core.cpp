@@ -138,17 +138,6 @@ float VU1Fast::normalizeResult(float value, uint32_t &laneFlags) const
 }
 
 
-int32_t VU1Fast::readBranchVi(uint8_t reg) const
-{
-    if (reg == 0u)
-        return 0;
-    if (m_viBranchBackupValid &&
-        m_viBranchBackupReg == reg)
-    {
-        return m_viBranchBackupValue;
-    }
-    return m_state.vi[reg];
-}
 
 void VU1Fast::recordViWriteForBranch(uint8_t reg, int32_t oldValue)
 {
@@ -638,19 +627,6 @@ void VU1Fast::queueP(float value, uint32_t latency)
     reportReservedInstruction(false, 0xFFFFFFF9u);
 }
 
-void VU1Fast::queueStore(uint32_t address, const uint32_t words[4], uint8_t laneMask)
-{
-    // The interpreter commits a store at the next cycle boundary, before PATH1 reads VU memory for
-    // that boundary and before any later instruction can load it, so writing now is equivalent.
-    if (m_activeVuData && address + 16u <= m_activeVuDataSize)
-    {
-        uint32_t *dst = reinterpret_cast<uint32_t *>(m_activeVuData + address);
-        if (laneMask & 0x8u) dst[0] = words[0];
-        if (laneMask & 0x4u) dst[1] = words[1];
-        if (laneMask & 0x2u) dst[2] = words[2];
-        if (laneMask & 0x1u) dst[3] = words[3];
-    }
-}
 
 void VU1Fast::queueVfWrite(uint8_t reg, uint8_t laneMask,
                                   const float value[4], uint32_t latency)
@@ -915,6 +891,24 @@ bool VU1Fast::pipelinesPending() const
         if (write.valid)
             return true;
     return false;
+}
+
+bool VU1Fast::tryEagerStatus()
+{
+    commitFlags(m_cycle);
+    for (uint32_t k = 0; k < m_flagCount; ++k)
+        if (m_flagPipeline[(m_flagHead + k) % kMaxFlagEntries].writesSticky)
+            return false;
+    for (uint32_t k = 0; k < m_flagCount; ++k)
+    {
+        FlagPipelineEntry &entry = m_flagPipeline[(m_flagHead + k) % kMaxFlagEntries];
+        if (!entry.writesStatus)
+            continue;
+        const uint32_t current = entry.status & 0xFu;
+        m_state.status = (m_state.status & 0xFF0u) | current | ((current | entry.extraSticky) << 6);
+        entry.writesStatus = false;
+    }
+    return true;
 }
 
 void VU1Fast::commitFlagsSlow(uint64_t now)
@@ -1824,8 +1818,8 @@ bool VU1Fast::stallPair(uint32_t pc, uint64_t budgetEnd)
 
 VU1CompiledFn VU1Fast::compiledFor(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc)
 {
-    if (!m_compiledEnabled || codeSize != 16384u || compiledRegions().empty())
-        return nullptr;
+    if (!m_compiledEnabled || codeSize != 16384u || m_activeVuDataSize != 16384u || compiledRegions().empty())
+        return nullptr; // s3recomp: generated code assumes VU1's 16 KB code and data memories
     const uint64_t generation = memory ? memory->getVU1CodeGeneration() : 0u;
     if (!memory || generation != m_residentGeneration || vuCode != m_residentCode)
     {

@@ -5,6 +5,7 @@
 #include <functional>
 #include <map>
 #include "ps2_vu1_fast.h"
+#include "ps2_vu1_turbo_inl.h"
 #undef private
 #include <cstdio>
 #include <cstring>
@@ -175,6 +176,16 @@ static void beginBlockTiming(BlockTiming &t)
 static bool pairIsControl(const VU1Fast::DecodedInstructionPair &d)
 {
     return d.eBit || d.dBit || d.tBit || (!d.iBit && d.lowerUsage.pipeline == VU1Fast::PipelineBranch);
+}
+
+// s3recomp: whether the pair before A may be a control pair whose delay slot A is. Before the
+// program's first pair lies memory outside the program, so that is treated as possible (it used to
+// be decoded from beyond the program's buffer).
+static bool prevPairMayBeControl(VU1Fast &dec, const Program &p, uint32_t A)
+{
+    if (A <= p.addr)
+        return true;
+    return pairIsControl(dec.decodeInstructionPair(p.code.data() - p.addr, A - 8u));
 }
 
 // Programs that never read or set the status flag apply FMAC status results at issue
@@ -350,7 +361,7 @@ static void emitPair(std::string &o, VU1Fast &dec, const Program &p, uint32_t A,
 {
     const auto d = dec.decodeInstructionPair(p.code.data() - p.addr, A);
     const bool plainEnd = pairIndex > 0 && !pairIsControl(d) &&
-                          !pairIsControl(dec.decodeInstructionPair(p.code.data() - p.addr, (A - 8u) & 0x3FFFu));
+                          !prevPairMayBeControl(dec, p, A);
     const uint32_t next = (A + 8u) & 0x3FFFu;
     emit(o, "  { // 0x%04X\n    if (v.m_cycle >= budgetEnd || v.m_stopRequested) return kGenBudget;\n", A);
     if (d.upperUsage.reserved || d.lowerUsage.reserved)
@@ -466,15 +477,261 @@ static void emitPairExec(std::string &o, const VU1Fast::DecodedInstructionPair &
     {
         emit(o, "    { float oldVf[4], upperVf[4]; std::memcpy(oldVf, v.m_state.vf[%u], 16); v.execUpperInlDaz(0x%08Xu); std::memcpy(upperVf, v.m_state.vf[%u], 16); std::memcpy(v.m_state.vf[%u], oldVf, 16);\n",
              d.upperVfShadowReg, d.upper, d.upperVfShadowReg, d.upperVfShadowReg);
-        emit(o, "      v.execLowerInl(0x%08Xu, v.m_activeVuData, v.m_activeVuDataSize, *v.m_activeGs, v.m_activeMemory, 0x%08Xu); std::memcpy(v.m_state.vf[%u], upperVf, 16); }\n",
+        emit(o, "      v.execLowerInl(0x%08Xu, v.m_activeVuData, 0x4000u, *v.m_activeGs, v.m_activeMemory, 0x%08Xu); std::memcpy(v.m_state.vf[%u], upperVf, 16); }\n",
              d.lower, d.upper, d.upperVfShadowReg);
     }
     else
     {
         if (!upperNop && macDead) emit(o, "    v.m_skipMac = true; v.execUpperInlDaz(0x%08Xu); v.m_skipMac = false;\n", d.upper);
         else if (!upperNop) emit(o, "    v.execUpperInlDaz(0x%08Xu);\n", d.upper);
-        if (!lowerNop) emit(o, "    v.execLowerInl(0x%08Xu, v.m_activeVuData, v.m_activeVuDataSize, *v.m_activeGs, v.m_activeMemory, 0x%08Xu);\n", d.lower, d.upper);
+        if (!lowerNop) emit(o, "    v.execLowerInl(0x%08Xu, v.m_activeVuData, 0x4000u, *v.m_activeGs, v.m_activeMemory, 0x%08Xu);\n", d.lower, d.upper);
     }
+}
+
+// s3recomp: turbo segments (see ps2_vu1_turbo_inl.h). Runs of plain pairs inside a lean block whose
+// flag results are scheduled here, at generation time, instead of through the flag pipeline.
+static bool g_turbo = true;
+static bool g_programEager = false; // per program: no status flag reads or FSSET
+static int g_turboSegments = 0, g_turboPairs = 0;
+
+static bool lowerIsFdivIssue(const VU1Fast::DecodedInstructionPair &x)
+{
+    if (x.iBit || (x.lower >> 25) != 0x40u || (x.lower & 0x3Cu) != 0x3Cu)
+        return false;
+    const uint32_t sub = (x.lower & 3u) | ((x.lower >> 4) & 0x7Cu);
+    return sub == 0x38u || sub == 0x39u || sub == 0x3Au; // DIV, SQRT, RSQRT
+}
+static bool lowerIsMfp(const VU1Fast::DecodedInstructionPair &x)
+{
+    if (x.iBit || (x.lower >> 25) != 0x40u || (x.lower & 0x3Cu) != 0x3Cu)
+        return false;
+    return ((x.lower & 3u) | ((x.lower >> 4) & 0x7Cu)) == 0x64u;
+}
+static bool upperIsTurboFmac(uint32_t u) { return !isUpperNop(u) && vu1turbo::isTurboFmac(u) && ((u >> 21) & 0xFu) != 0u; }
+static bool upperIsClip(uint32_t u) { return !isUpperNop(u) && vu1turbo::isClip(u); }
+
+static bool pairTurboEligible(const VU1Fast::DecodedInstructionPair &x)
+{
+    if (x.upperUsage.reserved || x.lowerUsage.reserved)
+        return false;
+    const uint32_t u = x.upper;
+    if (!isUpperNop(u))
+    {
+        const auto f = vu1turbo::fmacInfo(u);
+        const bool fmacNoDest = f.kind != vu1turbo::kNone && ((u >> 21) & 0xFu) == 0u;
+        if (!(fmacNoDest || vu1turbo::isTurboFmac(u) || vu1turbo::isClip(u) || vu1turbo::isMiscNoFlags(u)))
+            return false;
+    }
+    if (x.iBit)
+        return true;
+    const uint32_t op = x.lower >> 25;
+    if (op == 0x11u || op == 0x14u || op == 0x15u || op == 0x16u || op == 0x17u) // FCSET, status flag ops
+        return false;
+    if ((op == 0x18u || op == 0x1Au || op == 0x1Bu || op == 0x1Cu) && ((x.lower >> 16) & 0xFu) == 0u)
+        return false; // a flag read into VI0 does not commit the flags first (kept on the exact path)
+    if (x.lowerUsage.pipeline == VU1Fast::PipelineBranch || x.lowerUsage.pipeline == VU1Fast::PipelineEfu ||
+        x.lowerUsage.pipeline == VU1Fast::PipelineXgkick || x.lowerUsage.waitP)
+        return false;
+    return true;
+}
+
+// Emits pairs s..e-1 of a lean block as one turbo segment. issue[] are the static issue cycles
+// relative to the block's entry cycle b.
+static void emitTurboSegment(std::string &o, const std::vector<VU1Fast::DecodedInstructionPair> &d, uint32_t start,
+                             uint32_t s, uint32_t e, const std::vector<int> &issue, const std::vector<bool> &deadAll,
+                             uint32_t progAddr, const std::vector<std::vector<std::pair<int, int>>> &storeVf,
+                             const std::vector<std::vector<int>> &storeVi, bool clearBackup)
+{
+    ++g_turboSegments;
+    g_turboPairs += int(e - s);
+    const int E = issue[e - 1] + 1; // the cycle after the segment's last pair, relative to b
+    std::vector<int> macWriters, clipWriters;
+    int lastFmac = -1;
+    bool anyFmac = false;
+    for (uint32_t k = s; k < e; ++k)
+    {
+        if (upperIsTurboFmac(d[k].upper)) { macWriters.push_back(int(k)); lastFmac = int(k); anyFmac = true; }
+        if (upperIsClip(d[k].upper)) clipWriters.push_back(int(k));
+    }
+    auto deadAt = [&](int k) { return bool(deadAll[(start + uint32_t(k) * 8u - progAddr) / 8u]); };
+    // which results are needed: read inside the segment, or published at its end
+    std::set<int> needMac, needClip;
+    auto visibleWriter = [&](const std::vector<int> &w, int k) {
+        int best = -1;
+        for (int j : w)
+            if (j < k && issue[j] + 4 <= issue[k]) best = j;
+        return best;
+    };
+    for (uint32_t k = s; k < e; ++k)
+    {
+        const auto &x = d[k];
+        if (x.iBit) continue;
+        const uint32_t op = x.lower >> 25;
+        if (op == 0x18u || op == 0x1Au || op == 0x1Bu)
+        { const int j = visibleWriter(macWriters, int(k)); if (j >= 0) needMac.insert(j); }
+        if (op == 0x10u || op == 0x12u || op == 0x13u || op == 0x1Cu)
+        { const int j = visibleWriter(clipWriters, int(k)); if (j >= 0) needClip.insert(j); }
+    }
+    int directMac = -1, directClip = -1;
+    std::vector<int> late; // pairs whose results are still in flight at E, in issue order
+    for (int j : macWriters)
+        if (issue[j] + 4 <= E) directMac = j;
+    for (int j : clipWriters)
+        if (issue[j] + 4 <= E) directClip = j;
+    if (directMac >= 0 && deadAt(directMac)) directMac = -1;
+    if (directMac >= 0) needMac.insert(directMac);
+    if (directClip >= 0) needClip.insert(directClip);
+    for (uint32_t k = s; k < e; ++k)
+    {
+        const bool m = upperIsTurboFmac(d[k].upper) && issue[k] + 4 > E && !deadAt(int(k));
+        const bool c = upperIsClip(d[k].upper) && issue[k] + 4 > E;
+        if (m) needMac.insert(int(k));
+        if (c) needClip.insert(int(k));
+        if (m || c) late.push_back(int(k));
+    }
+
+    emit(o, "  { // turbo 0x%04X-0x%04X\n", start + s * 8u, start + (e - 1u) * 8u);
+    if (anyFmac)
+        emit(o, "    vu1turbo::Sticky tst{_mm_setzero_ps(), _mm_setzero_ps(), 0u};\n    uint32_t tcur = v.m_state.status & 0xFu, tdummy = 0u;\n");
+    if (!clipWriters.empty())
+        emit(o, "    uint32_t twc = v.m_workingClip;\n");
+    if (clearBackup)
+        emit(o, "    v.m_viBranchBackupValid = false;\n");
+    for (uint32_t k = s; k < e; ++k)
+    {
+        const auto &x = d[k];
+        const uint32_t A = start + k * 8u;
+        const int c = issue[k];
+        emit(o, "    // 0x%04X\n", A);
+        const auto f = vu1turbo::fmacInfo(x.upper);
+        const bool upperReadsQ = !isUpperNop(x.upper) && upperIsTurboFmac(x.upper) && f.src == vu1turbo::kQ;
+        if (upperReadsQ || lowerIsFdivIssue(x) || lowerIsMfp(x))
+            emit(o, "    v.m_cycle = b + %du; v.commitIfDue();\n", c);
+        const uint8_t writtenVi = x.viWriteMask ? static_cast<uint8_t>(__builtin_ctz(x.viWriteMask)) : 0u;
+        const bool records = writtenVi && x.lowerUsage.delaysNextBranchRead && k + 1u == e;
+        if (records)
+            emit(o, "    const int32_t oldVi = v.m_state.vi[%u];\n", writtenVi);
+        // upper
+        std::string up;
+        if (upperIsTurboFmac(x.upper))
+        {
+            char mv[32] = "tdummy";
+            if (needMac.count(int(k)))
+            {
+                emit(o, "    uint32_t tmac%u = 0u;\n", k);
+                std::snprintf(mv, sizeof mv, "tmac%u", k);
+            }
+            char buf[200];
+            std::snprintf(buf, sizeof buf, "vu1TurboFmac<0x%08Xu, %s, %s>(v, tst, %s, %s);", x.upper, needMac.count(int(k)) ? "true" : "false",
+                          int(k) == lastFmac ? "true" : "false", mv, int(k) == lastFmac ? "tcur" : "tdummy");
+            up = buf;
+        }
+        else if (upperIsClip(x.upper))
+        {
+            char buf[160];
+            std::snprintf(buf, sizeof buf, "twc = ((twc << 6) | vu1TurboClipBits<0x%08Xu>(v)) & 0xFFFFFFu;", x.upper);
+            up = buf;
+            if (needClip.count(int(k)))
+                up += " const uint32_t tclip" + std::to_string(k) + " = twc;";
+        }
+        else if (!isUpperNop(x.upper) && vu1turbo::isMiscNoFlags(x.upper) && ((x.upper >> 21) & 0xFu) != 0u)
+        {
+            char buf[64];
+            std::snprintf(buf, sizeof buf, "v.execUpperInlDaz(0x%08Xu);", x.upper);
+            up = buf;
+        }
+        // lower
+        std::string lo;
+        const bool lowerNop = x.iBit || x.lower == 0u || x.lower == 0x8000033Cu;
+        if (!lowerNop)
+        {
+            const uint32_t op = x.lower >> 25;
+            const unsigned it = (x.lower >> 16) & 0xFu, is = (x.lower >> 11) & 0xFu;
+            auto macSrc = [&]() {
+                const int j = visibleWriter(macWriters, int(k));
+                return j >= 0 ? "tmac" + std::to_string(j) : "(v.commitFlags(b + " + std::to_string(c) + "u), v.m_state.mac)";
+            };
+            auto clipSrc = [&]() {
+                const int j = visibleWriter(clipWriters, int(k));
+                return j >= 0 ? "tclip" + std::to_string(j) : "(v.commitFlags(b + " + std::to_string(c) + "u), v.m_state.clip)";
+            };
+            char buf[256];
+            const uint32_t imm24 = x.lower & 0xFFFFFFu;
+            if (op == 0x18u)
+                std::snprintf(buf, sizeof buf, "v.m_state.vi[%u] = ((%s & 0xFFFFu) == (uint32_t)(uint16_t)v.m_state.vi[%u]) ? 1 : 0;", it, macSrc().c_str(), is);
+            else if (op == 0x1Au)
+                std::snprintf(buf, sizeof buf, "v.m_state.vi[%u] = (int32_t)(%s & (uint32_t)(uint16_t)v.m_state.vi[%u]);", it, macSrc().c_str(), is);
+            else if (op == 0x1Bu)
+                std::snprintf(buf, sizeof buf, "v.m_state.vi[%u] = (int32_t)(%s | (uint32_t)(uint16_t)v.m_state.vi[%u]);", it, macSrc().c_str(), is);
+            else if (op == 0x10u)
+                std::snprintf(buf, sizeof buf, "v.m_state.vi[1] = ((%s & 0xFFFFFFu) == 0x%Xu) ? 1 : 0;", clipSrc().c_str(), imm24);
+            else if (op == 0x12u)
+                std::snprintf(buf, sizeof buf, "v.m_state.vi[1] = ((%s & 0x%Xu) != 0u) ? 1 : 0;", clipSrc().c_str(), imm24);
+            else if (op == 0x13u)
+                std::snprintf(buf, sizeof buf, "v.m_state.vi[1] = ((%s | 0x%Xu) == 0xFFFFFFu) ? 1 : 0;", clipSrc().c_str(), imm24);
+            else if (op == 0x1Cu)
+                std::snprintf(buf, sizeof buf, "v.m_state.vi[%u] = static_cast<int32_t>(%s & 0x0FFFu);", it, clipSrc().c_str());
+            else
+            {
+                if (lowerIsFdivIssue(x) || lowerIsMfp(x))
+                    std::snprintf(buf, sizeof buf, "v.execLowerInl(0x%08Xu, v.m_activeVuData, 0x4000u, *v.m_activeGs, v.m_activeMemory, 0x%08Xu);", x.lower, x.upper);
+                else
+                    std::snprintf(buf, sizeof buf, "v.execLowerInl(0x%08Xu, v.m_activeVuData, 0x4000u, *v.m_activeGs, v.m_activeMemory, 0x%08Xu);", x.lower, x.upper);
+            }
+            lo = buf;
+        }
+        if (x.iBit)
+        {
+            if (!up.empty()) emit(o, "    %s\n", up.c_str());
+            emit(o, "    { uint32_t ib = 0x%08Xu; float f; std::memcpy(&f, &ib, 4); v.m_state.i = v.normalizeOperand(f); }\n", x.lower);
+        }
+        else if (x.upperVfShadowReg && !up.empty())
+        {
+            const unsigned R = x.upperVfShadowReg;
+            emit(o, "    { float oldVf[4], upperVf[4]; std::memcpy(oldVf, v.m_state.vf[%u], 16);\n      %s\n      std::memcpy(upperVf, v.m_state.vf[%u], 16); std::memcpy(v.m_state.vf[%u], oldVf, 16);\n", R, up.c_str(), R, R);
+            if (!lo.empty()) emit(o, "      %s\n", lo.c_str());
+            emit(o, "      std::memcpy(v.m_state.vf[%u], upperVf, 16); }\n", R);
+        }
+        else
+        {
+            if (!up.empty()) emit(o, "    %s\n", up.c_str());
+            if (!lo.empty()) emit(o, "    %s\n", lo.c_str());
+        }
+        if (writtenVi)
+            emit(o, "    v.m_state.vi[%u] = static_cast<int16_t>(v.m_state.vi[%u]);\n", writtenVi, writtenVi);
+        for (auto &[r, l] : storeVf[k])
+        {
+            int lat = 0;
+            for (uint32_t w = 0; w < x.writeCount; ++w)
+                if ((x.writeReg[w] & 31) == r && (x.writeLanes[w] & (8u >> l))) lat = x.writeLatency[w];
+            emit(o, "    v.m_vfReady[%d][%d] = b + %du;\n", r, l, c + lat);
+        }
+        for (int r : storeVi[k])
+            emit(o, "    v.m_viReady[%d] = b + %du;\n", r, c + x.viWriteLatency);
+        if (records)
+            emit(o, "    v.recordViWriteForBranch(%u, oldVi);\n", writtenVi);
+        if (g_programWritesZeroRegs)
+            emit(o, "    v.resetZeroRegs();\n");
+    }
+    // End of the segment: the core's cycle, then the flag results as the pipeline holds them now.
+    emit(o, "    v.m_cycle = b + %du;\n", E);
+    if (directMac >= 0 || directClip >= 0)
+        emit(o, "    v.commitFlags(b + %du);\n", E);
+    if (directMac >= 0)
+        emit(o, "    v.m_state.mac = tmac%d;\n", directMac);
+    if (directClip >= 0)
+        emit(o, "    v.m_state.clip = tclip%d;\n", directClip);
+    for (int j : late)
+    {
+        const bool m = upperIsTurboFmac(d[j].upper);
+        emit(o, "    v.turboPushFlag(b + %du, %s, %s, %s, %s);\n", issue[j], m ? "true" : "false",
+             m ? ("tmac" + std::to_string(j)).c_str() : "0u", m ? "false" : "true", m ? "0u" : ("tclip" + std::to_string(j)).c_str());
+    }
+    if (anyFmac)
+        emit(o, "    v.m_state.status = (v.m_state.status & 0xFF0u) | tcur | (vu1TurboStickyBits(tst) << 6);\n");
+    if (!clipWriters.empty())
+        emit(o, "    v.m_workingClip = twc;\n");
+    emit(o, "    v.commitIfDue();\n  }\n");
 }
 
 // Returns false (emitting nothing) when the block cannot be lean.
@@ -567,7 +824,46 @@ static bool emitLeanBlock(std::string &o, VU1Fast &dec, const Program &p, uint32
         cond += " && v.m_viReady[" + std::to_string(r) + "] <= b + " + std::to_string(at) + "u";
     if (fdivGuard >= 0)
         cond += " && (!v.m_fdiv.valid || v.m_fdiv.readyCycle <= b + " + std::to_string(fdivGuard) + "u)";
+    // s3recomp: turbo segments: maximal runs of at least two eligible plain pairs
+    std::vector<uint32_t> segEnd(n, 0u); // segEnd[k] > k when a segment starts at k
+    bool anySegment = false;
+    if (g_turbo && g_programEager)
+    {
+        std::vector<bool> ok(n, false);
+        for (uint32_t k = 0; k < n; ++k)
+        {
+            const uint32_t A = start + k * 8u;
+            const bool prevCtrl = k > 0 ? pairIsControl(d[k - 1])
+                                        : prevPairMayBeControl(dec, p, A);
+            ok[k] = !pairIsControl(d[k]) && !prevCtrl && pairTurboEligible(d[k]);
+        }
+        for (uint32_t k = 0; k < n;)
+        {
+            if (!ok[k]) { ++k; continue; }
+            uint32_t e = k;
+            while (e < n && ok[e]) ++e;
+            if (e - k >= 2u) { segEnd[k] = e; anySegment = true; }
+            k = e;
+        }
+    }
+    if (anySegment)
+        cond += " && v.m_eagerStatus";
+    // s3recomp: a stall of the block's first pair (on results of earlier code) is taken here, as
+    // stallPair would take it, and the block then runs from that cycle. Later pairs' conditions are
+    // still checked after it.
+    std::string first;
+    for (auto &[rl, at] : vfGuard)
+        if (at == 0) first += " r = std::max(r, v.m_vfReady[" + std::to_string(rl.first) + "][" + std::to_string(rl.second) + "]);";
+    for (auto &[r, at] : viGuard)
+        if (at == 0) first += " r = std::max(r, v.m_viReady[" + std::to_string(r) + "]);";
+    if (fdivGuard == 0)
+        first += " if (v.m_fdiv.valid) r = std::max(r, v.m_fdiv.readyCycle);";
     emit(o, "int %s(VU1Fast &v, uint64_t budgetEnd)\n{\n", name.c_str());
+    if (!first.empty())
+    {
+        emit(o, "  { uint64_t r = v.m_cycle;%s\n", first.c_str());
+        emit(o, "    if (r > v.m_cycle) { if (r + %du > budgetEnd || v.m_stopRequested || v.m_xgkick.active) return %s(v, budgetEnd); v.advanceTo(r); } }\n", total, exactName.c_str());
+    }
     emit(o, "  const uint64_t b = v.m_cycle;\n");
     emit(o, "  if (!(b + %du <= budgetEnd && !v.m_stopRequested && !v.m_xgkick.active%s))\n    return %s(v, budgetEnd);\n", total, cond.c_str(), exactName.c_str());
     emit(o, "  v.commitIfDue();\n");
@@ -583,6 +879,16 @@ static bool emitLeanBlock(std::string &o, VU1Fast &dec, const Program &p, uint32
     bool lastPlain = false;
     for (uint32_t k = 0; k < n; ++k)
     {
+        if (segEnd[k] > k)
+        {
+            const uint32_t e = segEnd[k];
+            emitTurboSegment(o, d, start, k, e, issue, deadAll, p.addr, storeVf, storeVi, k == 0 || prevRecorded);
+            const auto &lastPair = d[e - 1];
+            prevRecorded = lastPair.viWriteMask && lastPair.lowerUsage.delaysNextBranchRead;
+            lastPlain = true;
+            k = e - 1;
+            continue;
+        }
         const auto &x = d[k];
         const uint32_t A = start + k * 8u;
         const uint32_t next = (A + 8u) & 0x3FFFu;
@@ -590,7 +896,7 @@ static bool emitLeanBlock(std::string &o, VU1Fast &dec, const Program &p, uint32
         // like emitPair: the pair before a block's first pair may be its branch (blocks are capped in
         // length, so a delay slot can start a block)
         const bool prevCtrl = k > 0 ? pairIsControl(d[k - 1])
-                                    : pairIsControl(dec.decodeInstructionPair(p.code.data() - p.addr, (A - 8u) & 0x3FFFu));
+                                    : prevPairMayBeControl(dec, p, A);
         emit(o, "  { // 0x%04X%s\n", A, ctrl ? " control" : "");
         if (k > 0 && issue[k] > issue[k - 1] + 1)
             emit(o, "    v.advanceTo(b + %du);\n", issue[k]);
@@ -687,6 +993,8 @@ int main(int argc, char **argv)
             outDir = argv[++a];
         else if (arg == "--no-lean")
             g_leanBlocks = false;
+        else if (arg == "--no-turbo")
+            g_turbo = false;
         else if (arg == "--tag" && a + 1 < argc)
             tag = argv[++a];
         else
@@ -748,6 +1056,7 @@ int main(int argc, char **argv)
         const uint64_t h = vu1RegionHash(p.code.data(), uint32_t(p.code.size()));
         const std::set<uint32_t> leaders = findLeaders(dec, p);
         const std::vector<bool> deadAll = deadMacProgram(dec, p, leaders);
+        g_programEager = programAllowsEagerStatus(dec, p);
         g_programWritesZeroRegs = false;
         for (uint32_t A = p.addr; A < p.addr + uint32_t(p.code.size()); A += 8)
         {
@@ -785,7 +1094,7 @@ int main(int argc, char **argv)
                 flushPart();
                 partName = "vu1_" + std::to_string(idx) + "_" + std::to_string(part++) + ".cpp";
                 o = header;
-                emit(o, "// VU1 program %d\n#include \"ps2_vu1_fast_inl.h\"\n#include <algorithm>\n#include <cstring>\n\n", idx);
+                emit(o, "// VU1 program %d\n#include \"ps2_vu1_fast_inl.h\"\n#include \"ps2_vu1_turbo_inl.h\"\n#include <algorithm>\n#include <cstring>\n\n", idx);
                 pairsInPart = 0;
             }
             char nameBuf[64];
@@ -827,11 +1136,14 @@ int main(int argc, char **argv)
         eagerPrograms += eager ? 1 : 0;
         emit(o, "};\n\nint run(VU1Fast &v, uint64_t budgetEnd)\n{\n");
         emit(o, "    for (;;)\n    {\n        const uint32_t pc = v.m_state.pc;\n        if (pc < 0x%Xu || pc >= 0x%Xu)\n            return kGenLeft;\n", p.addr, end);
+        // s3recomp: eager status can start later in the program (VU1Fast::tryEagerStatus).
+        if (eager)
+            emit(o, "        if (!v.m_eagerStatus)\n            v.m_eagerStatus = v.tryEagerStatus();\n");
         emit(o, "        const BlockFn f = kBlocks[(pc - 0x%Xu) >> 3];\n        if (!f)\n            return kGenFallback;\n", p.addr);
         emit(o, "        const int r = f(v, budgetEnd);\n        if (r != kGenNext)\n            return r;\n    }\n}\n} // namespace\n\n");
         emit(o, "int vu1prog_%d(VU1Fast &v, uint64_t budgetEnd)\n{\n", idx);
         if (eager)
-            emit(o, "    v.m_eagerStatus = !v.statusFlagsPending(); // nothing in this program reads the status flag\n    const int r = run(v, budgetEnd);\n    v.m_eagerStatus = false;\n    return r;\n}\n");
+            emit(o, "    v.m_eagerStatus = v.tryEagerStatus(); // nothing in this program reads the status flag\n    const int r = run(v, budgetEnd);\n    v.m_eagerStatus = false;\n    return r;\n}\n");
         else
             emit(o, "    return run(v, budgetEnd);\n}\n");
         flushPart();
@@ -860,6 +1172,6 @@ int main(int argc, char **argv)
     size_t pairs = 0;
     for (auto &[key, p] : uniq)
         pairs += p.code.size() / 8;
-    std::printf("ps2_vu1gen: %d VU1 programs (%zu instruction pairs; %d without status reads, %zu dead MAC results; %d of %d blocks lean) in %zu source files\n", idx, pairs, eagerPrograms, deadMacPairs, g_leanCount, g_blockCount, written.size());
+    std::printf("ps2_vu1gen: %d VU1 programs (%zu instruction pairs; %d without status reads, %zu dead MAC results; %d of %d blocks lean, %d turbo segments of %d pairs) in %zu source files\n", idx, pairs, eagerPrograms, deadMacPairs, g_leanCount, g_blockCount, g_turboSegments, g_turboPairs, written.size());
     return 0;
 }

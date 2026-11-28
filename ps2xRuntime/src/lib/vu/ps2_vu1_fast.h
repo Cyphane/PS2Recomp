@@ -404,6 +404,14 @@ public: // generated VU1 code accesses the core directly
     // Both are off outside generated code.
     bool m_eagerStatus = false;
     bool m_skipMac = false;
+    // s3recomp: switches on eager status (for programs that never read the status flag) when the
+    // flag pipeline allows it. Results due by now are committed as any reader would; FMAC status
+    // results still in flight are then applied at once, in issue order: no instruction can read the
+    // status flag before the program ends, every later status write is applied after them, and the
+    // Q commits in between change other bits (D/I), so the status flag ends up exactly as before.
+    // MAC and clip results stay in the pipeline. Not done while an FSSET result is in flight (it
+    // rewrites the sticky D/I bits too).
+    bool tryEagerStatus();
     bool statusFlagsPending() const
     {
         for (uint32_t k = 0; k < m_flagCount; ++k)
@@ -414,11 +422,44 @@ public: // generated VU1 code accesses the core directly
         }
         return false;
     }
+    // s3recomp: turbo generated segments (see ps2_vu1_turbo_inl.h) schedule the flags of their own
+    // instructions at generation time. When one of their FMACs needs the exact scalar path, its flag
+    // results are captured here instead of being applied (turbo code runs only with m_eagerStatus).
+    bool m_captureFlags = false;
+    bool m_capValid = false;
+    uint32_t m_capMac = 0;
+    uint32_t m_capStatus = 0;
+    uint32_t m_capSticky = 0;
+    void turboUpperSlow(uint32_t instr); // exact upper instruction with its flags captured
+    // Adds a flag result of a turbo segment to the pipeline (issue order, after everything already in it).
+    VU1_HOT_INLINE void turboPushFlag(uint64_t issueCycle, bool writesMac, uint32_t mac, bool writesClip, uint32_t clip)
+    {
+        FlagPipelineEntry *e = pushFlagEntry();
+        if (!e)
+        {
+            reportReservedInstruction(true, 0xFFFFFFFFu);
+            return;
+        }
+        e->issueCycle = issueCycle;
+        e->readyCycle = issueCycle + kFmacLatency;
+        e->mac = mac;
+        e->writesMac = writesMac;
+        e->clip = clip;
+        e->writesClip = writesClip;
+    }
     // Returns true when the FMAC flag results were handled here.
     VU1_HOT_INLINE bool flagsAtIssue(uint32_t mac, uint32_t status, uint32_t extraSticky)
     {
         if (!m_eagerStatus)
             return false;
+        if (m_captureFlags)
+        {
+            m_capValid = true;
+            m_capMac = mac;
+            m_capStatus = status;
+            m_capSticky = extraSticky;
+            return true;
+        }
         const uint32_t current = status & 0xFu;
         m_state.status = (m_state.status & 0xFF0u) | current | ((current | extraSticky) << 6);
         if (m_skipMac)
@@ -489,7 +530,24 @@ public: // generated VU1 code accesses the core directly
     void queueFcset(uint32_t clip);
     void queueQ(float value, uint32_t latency, uint32_t statusDi);
     void queueP(float value, uint32_t latency);
-    void queueStore(uint32_t address, const uint32_t words[4], uint8_t laneMask);
+    // The interpreter commits a store at the next cycle boundary, before PATH1 reads VU memory for
+    // that boundary and before any later instruction can load it, so writing now is equivalent.
+    VU1_HOT_INLINE void queueStore(uint32_t address, const uint32_t words[4], uint8_t laneMask)
+    {
+        if (m_activeVuData && address + 16u <= m_activeVuDataSize)
+        {
+            uint8_t *dst = m_activeVuData + address;
+            if (laneMask == 0xFu)
+            {
+                __builtin_memcpy(dst, words, 16);
+                return;
+            }
+            if (laneMask & 0x8u) __builtin_memcpy(dst, &words[0], 4);
+            if (laneMask & 0x4u) __builtin_memcpy(dst + 4, &words[1], 4);
+            if (laneMask & 0x2u) __builtin_memcpy(dst + 8, &words[2], 4);
+            if (laneMask & 0x1u) __builtin_memcpy(dst + 12, &words[3], 4);
+        }
+    }
     void queueVfWrite(uint8_t reg, uint8_t laneMask, const float value[4], uint32_t latency);
     void queueViWrite(uint8_t reg, int32_t value, uint32_t latency);
     void queueAccWrite(uint8_t laneMask, const float value[4], uint32_t latency);
@@ -525,7 +583,14 @@ public: // generated VU1 code accesses the core directly
     }
     float normalizeResult(float value, uint32_t &laneFlags) const;
     uint32_t microAddressMask() const { return m_unit == Unit::VU1 ? 0x3FFFu : 0x0FFFu; }
-    int32_t readBranchVi(uint8_t reg) const;
+    VU1_HOT_INLINE int32_t readBranchVi(uint8_t reg) const
+    {
+        if (reg == 0u)
+            return 0;
+        if (m_viBranchBackupValid && m_viBranchBackupReg == reg)
+            return m_viBranchBackupValue;
+        return m_state.vi[reg];
+    }
     void recordViWriteForBranch(uint8_t reg, int32_t oldValue);
     void reportReservedInstruction(bool upper, uint32_t instruction);
     float broadcast(const float *vf, uint8_t bc) { return normalizeOperand(vf[bc & 3u]); }

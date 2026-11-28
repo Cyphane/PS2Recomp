@@ -74,6 +74,7 @@ namespace s3gfx
         uint32_t vpuStat = 0; // VU1 stop reason bits for VPU_STAT, applied at completion
         bool vpuStatSet = false;
         uint64_t doneNs = 0;  // when the worker finished it
+        bool early = false;   // its DMA completion was applied at kick time (earlyCompletion)
     };
 
     thread_local Job *t_job = nullptr;           // worker: job being processed
@@ -130,6 +131,22 @@ namespace s3gfx
             return v && v[0] == '1';
         }();
         return on;
+    }
+    // s3recomp: early completion (work in progress, off by default: PS2X_GFX_EARLY_DONE=1 with
+    // PS2X_GFX_THREAD=1 turns it on; it still breaks Shining Wind's tornado, which then draws black). A VIF1/GIF kick completes on the EE thread straight away - D_STAT, the DMAC handler cause,
+    // CHCR.STR and QWC - exactly as the synchronous path completes it, while the worker runs the
+    // transfer behind. From the EE's side the kick then looks just like a synchronous one, and the EE
+    // waits for the worker only where it could see the worker's results: VIF/GIF registers, VU1
+    // memory, GS registers other than CSR, and the GS library calls (see the sync points). Suikoden
+    // III polls the channel right after each kick, so with completion at the end of the job the EE
+    // simply waited for the worker every time.
+    bool earlyCompletion()
+    {
+        static const bool on = [] {
+            const char *v = std::getenv("PS2X_GFX_EARLY_DONE");
+            return v && v[0] == '1';
+        }();
+        return on && enabled();
     }
     // For the VU1 callbacks (ps2_runtime.cpp), which run on the worker inside a job.
     bool jobFbrst(uint32_t &fbrst)
@@ -222,6 +239,7 @@ namespace s3gfx
         }
     }
 
+    static void sync(int reason);
     static void enqueue(uint32_t channel, std::vector<std::vector<uint8_t>> &&chunks)
     {
         if (!g_started)
@@ -229,18 +247,34 @@ namespace s3gfx
             g_started = true;
             std::thread(workerMain).detach();
         }
+        const bool early = earlyCompletion();
+        // Do not let the EE run arbitrarily far ahead of the worker (the GS library calls at each
+        // frame end normally hold it back long before this).
+        if (early && g_outstanding.load(std::memory_order_acquire) >= 4096)
+            sync(5);
         Job job;
         job.channel = channel;
         job.chunks = std::move(chunks);
+        job.early = early;
         stat[channel == 1u ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
         job.fbrst = g_captureFbrst ? g_captureFbrst() : 0u;
-        ++g_channelJobs[channel];
+        if (!early)
+            ++g_channelJobs[channel];
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             g_queue.push_back(std::move(job));
             g_outstanding.fetch_add(1, std::memory_order_acq_rel);
         }
         g_workCv.notify_one();
+        if (early)
+        {
+            // Complete it now, as the synchronous path would after processing it.
+            stat[2].fetch_add(1, std::memory_order_relaxed);
+            t_applyChannel = channel;
+            t_applyLast = g_channelJobs[channel] == 0;
+            g_mem->processPendingTransfers(); // applies t_applyChannel's completion
+            t_applyChannel = 0;
+        }
     }
 
     // EE thread: apply finished jobs' completions in kick order.
@@ -259,7 +293,8 @@ namespace s3gfx
         for (Job &job : done)
         {
             const uint64_t latencyUs = (now - job.doneNs) / 1000u;
-            stat[2].fetch_add(1, std::memory_order_relaxed);
+            if (!job.early)
+                stat[2].fetch_add(1, std::memory_order_relaxed);
             stat[6].fetch_add(latencyUs, std::memory_order_relaxed);
             uint64_t prevMax = stat[7].load(std::memory_order_relaxed);
             while (latencyUs > prevMax && !stat[7].compare_exchange_weak(prevMax, latencyUs))
@@ -268,6 +303,8 @@ namespace s3gfx
             stat[8 + t_applyVia].fetch_add(1, std::memory_order_relaxed);
             if (job.vpuStatSet && g_applyVpuStat)
                 g_applyVpuStat(job.vpuStat);
+            if (job.early)
+                continue; // its DMA completed at kick time
             t_applyChannel = job.channel;
             t_applyLast = --g_channelJobs[job.channel] == 0;
             g_mem->processPendingTransfers(); // applies t_applyChannel's completion
@@ -1511,6 +1548,9 @@ void PS2Memory::write128(uint32_t address, __m128i value)
     }
     if (!scratch && physAddr == 0x10005000u) // VIF1_FIFO
     {
+        // s3recomp: VIF1 data written straight to the FIFO is processed here, on the EE thread: the
+        // graphics worker must have finished everything kicked before it (and must not run alongside).
+        s3gfx::syncPoint(2);
         alignas(16) uint8_t fifoData[16];
         _mm_storeu_si128(reinterpret_cast<__m128i *>(fifoData), value);
         processVIF1Data(fifoData, sizeof(fifoData));
@@ -2845,7 +2885,9 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         s3gfx::stat[4].fetch_add(1, std::memory_order_relaxed);
     if (const int r = s3gfx::ioReason(address); r >= 0 && !s3gfx::t_noSyncOnProcess)
     {
-        if (r == 2 || !s3gfx::enabled() || !s3gfx::pollStatusReads())
+        if (r != 2 && s3gfx::earlyCompletion())
+            s3gfx::pollFromRegisterRead(); // completions are applied at kick time: nothing to wait for
+        else if (r == 2 || !s3gfx::enabled() || !s3gfx::pollStatusReads())
             s3gfx::syncPoint(r);
         else
             s3gfx::pollFromRegisterRead();

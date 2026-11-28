@@ -40,6 +40,7 @@ namespace s3gfx
     bool enabled();
     void pollFromEe();
     bool hasOutstanding();
+    bool earlyCompletion();
     uint64_t spinNs();
 }
 
@@ -2301,7 +2302,8 @@ void EeScheduler::waitForEvent()
     const IdleTimer idleTimer;
     // s3recomp: while the graphics worker has work outstanding, its completion (which the game's
     // DMA handler answers with the next transfer) is due any moment: spin for it instead of sleeping.
-    if (s3gfx::enabled() && s3gfx::hasOutstanding() && s3gfx::spinNs() != 0u)
+    // (With early completion nothing the EE waits for comes from the worker, so there is no spin.)
+    if (s3gfx::enabled() && !s3gfx::earlyCompletion() && s3gfx::hasOutstanding() && s3gfx::spinNs() != 0u)
     {
         const auto end = std::chrono::steady_clock::now() + std::chrono::nanoseconds(s3gfx::spinNs());
         for (uint32_t n = 0; !m_checkpointPending.load(std::memory_order_acquire) && s3gfx::hasOutstanding(); ++n)
